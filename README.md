@@ -21,7 +21,8 @@ and Windows first, macOS later.
   (no full download)
 - Finder-style UI: List, Icon and Column views; tabs; drag & drop; Quick Look;
   thumbnails; full keyboard control; light and dark themes
-- Light: about 12 MB binary, 0 % CPU when idle
+- Dual pane, git status and history, live server stats, Open in Terminal
+- Light: about 14 MB binary, ~135 MB RAM, ~0 % CPU when idle
 
 ## Develop
 
@@ -40,5 +41,6 @@ Architecture, the IPC contract and the design brief are in [`docs/`](docs/).
 
 ## Status
 
-Early development. Installers for Windows and Linux will be published under
-Releases.
+Runs on Linux today. Windows and macOS hardening, cloud storage (Google
+Drive, iCloud Drive, Yandex Disk, OneDrive, Dropbox, S3, WebDAV, …) and
+installers for every OS are next. See [docs/ROADMAP.md](docs/ROADMAP.md).
