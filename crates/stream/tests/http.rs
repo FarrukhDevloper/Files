@@ -9,11 +9,16 @@ use vpsfiles_stream::{MediaOptions, MediaServer};
 use vpsfiles_vfs::local::{from_native, LocalBackend};
 use vpsfiles_vfs::{Location, SourceId};
 
+/// File names full of characters that need percent-encoding. Windows forbids
+/// `?` and `*` in file names, so it gets the same names without them.
+const CLIP: &str = if cfg!(windows) { "clip #1 100%.mp4" } else { "clip #1 100%?.mp4" };
+const PHOTO: &str = if cfg!(windows) { "photo (1)!'.jpg" } else { "photo (1)!'*.jpg" };
+
 async fn setup() -> (tempfile::TempDir, String, MediaServer, Vec<u8>) {
     let dir = tempfile::tempdir().unwrap();
     let root = from_native(dir.path());
     let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 253) as u8).collect();
-    std::fs::write(dir.path().join("clip #1 100%?.mp4"), &data).unwrap();
+    std::fs::write(dir.path().join(CLIP), &data).unwrap();
     std::fs::write(dir.path().join("ünï cødé.mp3"), b"abc").unwrap();
     std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
     std::fs::create_dir(dir.path().join("sub")).unwrap();
@@ -28,7 +33,7 @@ fn loc(root: &str, name: &str) -> Location {
 #[tokio::test]
 async fn full_and_head() {
     let (_d, root, server, data) = setup().await;
-    let url = server.url_for(&loc(&root, "clip #1 100%?.mp4"));
+    let url = server.url_for(&loc(&root, CLIP));
     assert!(url.starts_with(&format!("http://127.0.0.1:{}/", server.port())));
     assert!(url.ends_with("/clip%20%231%20100%25%3F.mp4"), "{url}");
 
@@ -54,7 +59,7 @@ async fn full_and_head() {
 #[tokio::test]
 async fn ranges() {
     let (_d, root, server, data) = setup().await;
-    let url = server.url_for(&loc(&root, "clip #1 100%?.mp4"));
+    let url = server.url_for(&loc(&root, CLIP));
     let size = data.len();
 
     for (spec, a, b) in [
@@ -88,7 +93,7 @@ async fn ranges() {
 #[tokio::test]
 async fn rejects_bad_requests() {
     let (_d, root, server, _data) = setup().await;
-    let good = server.url_for(&loc(&root, "clip #1 100%?.mp4"));
+    let good = server.url_for(&loc(&root, CLIP));
 
     // Wrong or missing token.
     let prefix = format!("http://127.0.0.1:{}/", server.port());
@@ -169,7 +174,7 @@ async fn image_thumbnails() {
     let dir = tempfile::tempdir().unwrap();
     let root = from_native(dir.path());
     let p = |name: &str| dir.path().join(name);
-    image_file(&p("photo (1)!'*.jpg"), DynamicImage::ImageRgb8(RgbImage::from_pixel(800, 400, Rgb([9, 99, 199]))));
+    image_file(&p(PHOTO), DynamicImage::ImageRgb8(RgbImage::from_pixel(800, 400, Rgb([9, 99, 199]))));
     image_file(&p("logo.png"), DynamicImage::ImageRgba8(RgbaImage::from_pixel(300, 300, Rgba([0, 0, 0, 0]))));
     std::fs::write(p("notes.txt"), "hi").unwrap();
     std::fs::write(p("broken.png"), "not a png").unwrap();
@@ -182,8 +187,9 @@ async fn image_thumbnails() {
     assert!(base.starts_with(&format!("http://127.0.0.1:{}/", server.port())) && !base.ends_with('/'), "{base}");
     assert!(server.url_for(&loc(&root, "logo.png")).starts_with(&format!("{base}/local/")));
 
-    let photo = thumb_url(&server, &loc(&root, "photo (1)!'*.jpg"), 128);
-    assert!(photo.contains("photo%20(1)!'*.jpg?v="), "{photo}");
+    let photo = thumb_url(&server, &loc(&root, PHOTO), 128);
+    // encodeURIComponent keeps !'()* literal; only the space is encoded.
+    assert!(photo.contains(&format!("{}?v=", PHOTO.replace(' ', "%20"))), "{photo}");
     let r = request(&photo, "GET", &[]).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(r.header("content-type"), Some("image/jpeg"));
@@ -208,7 +214,7 @@ async fn image_thumbnails() {
 
     // A changed file (other mtime/size) gets a fresh thumbnail.
     std::thread::sleep(std::time::Duration::from_millis(20));
-    image_file(&p("photo (1)!'*.jpg"), DynamicImage::ImageRgb8(RgbImage::new(100, 400)));
+    image_file(&p(PHOTO), DynamicImage::ImageRgb8(RgbImage::new(100, 400)));
     let r = request(&photo, "GET", &[]).await;
     assert_eq!((r.header("content-type"), dims(&r.body)), (Some("image/jpeg"), (32, 128)));
 
