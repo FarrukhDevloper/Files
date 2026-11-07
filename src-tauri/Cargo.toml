@@ -1,0 +1,28 @@
+[package]
+name = "vpsfiles-app"
+description = "VPS Files desktop app (Tauri shell: commands, events, wiring)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# `_lib` suffix avoids a name clash with the bin on Windows (cargo#8519).
+name = "vpsfiles_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+vpsfiles-vfs.workspace = true
+vpsfiles-ssh.workspace = true
+vpsfiles-transfer.workspace = true
+vpsfiles-stream.workspace = true
+tauri.workspace = true
+tauri-plugin-opener.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true

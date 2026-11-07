@@ -1,0 +1,24 @@
+[package]
+name = "vpsfiles-ssh"
+description = "SSH hosts from ~/.ssh/config, connection manager, SFTP backend, remote exec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vpsfiles-vfs.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

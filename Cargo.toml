@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = ["src-tauri", "crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# internal
+vpsfiles-vfs = { path = "crates/vfs" }
+vpsfiles-ssh = { path = "crates/ssh" }
+vpsfiles-transfer = { path = "crates/transfer" }
+vpsfiles-stream = { path = "crates/stream" }
+
+# async + plumbing
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+
+# ssh
+# ring instead of the default aws-lc-rs: aws-lc-sys needs CMake + NASM to
+# build for Windows, ring does not.
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "3"
+# hashed known_hosts entries (|1|salt|hash); already pulled in by russh
+hmac = "0.13"
+sha1 = "0.11"
+
+# media server
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+mime_guess = "2"
+
+# local fs
+trash = "5"
+fs4 = "1"
+
+# app
+tauri = { version = "2", features = [] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
+[profile.release]
+# small + fast binary
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+# deps (crypto in russh) are painfully slow unoptimized
+opt-level = 2

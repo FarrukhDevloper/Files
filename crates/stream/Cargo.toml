@@ -1,0 +1,19 @@
+[package]
+name = "vpsfiles-stream"
+description = "Loopback HTTP server that streams any VFS file with Range support (media player)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vpsfiles-vfs.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+axum.workspace = true
+mime_guess.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile = "3"
