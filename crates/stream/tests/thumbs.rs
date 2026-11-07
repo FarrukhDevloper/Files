@@ -143,6 +143,7 @@ impl RemoteExec for LocalExec {
 struct Lab {
     _dir: tempfile::TempDir,
     root: PathBuf,
+    #[cfg_attr(windows, allow(dead_code))] // only the freedesktop test reads it
     shared: PathBuf,
     fs: Arc<Counting>,
     server: MediaServer,
@@ -274,6 +275,7 @@ async fn exif_thumbnail_needs_only_the_first_bytes() {
     assert_eq!(decoded(&r.body).dimensions(), (85, 128));
 }
 
+#[cfg(not(windows))]
 fn png_text(bytes: &[u8], key: &str) -> Option<String> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().ok()?;
     let mut buf = vec![0; reader.output_buffer_size()?];
@@ -282,6 +284,7 @@ fn png_text(bytes: &[u8], key: &str) -> Option<String> {
     reader.info().uncompressed_latin1_text.iter().find(|t| t.keyword == key).map(|t| t.text.clone())
 }
 
+#[cfg(not(windows))]
 fn write_shared(shared: &Path, bucket: &str, uri: &str, mtime: i64, img: &RgbImage) -> PathBuf {
     let dir = shared.join(bucket);
     std::fs::create_dir_all(&dir).unwrap();
