@@ -3,6 +3,7 @@
 
 import { api } from "$lib/ipc/api";
 import type { PromptRequest } from "$lib/ipc/types";
+import { hosts } from "./hosts.svelte";
 import { toasts } from "./toasts.svelte";
 
 class Prompts {
@@ -11,6 +12,13 @@ class Prompts {
 
   async init() {
     await api.on("prompt:request", (p) => {
+      if (hosts.isQuiet(p.host)) {
+        // Safety net: quiet connects are non-interactive, so this shouldn't
+        // happen; if it does, never pop a sheet for a startup connect.
+        hosts.declinedPrompt(p.host);
+        void api.promptRespond(p.id, false, null).catch(() => {});
+        return;
+      }
       this.queue = [...this.queue, p];
     });
   }

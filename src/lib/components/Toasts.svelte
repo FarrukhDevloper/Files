@@ -2,7 +2,10 @@
   import CircleExclamation from "@lucide/svelte/icons/circle-exclamation-point";
   import Info from "@lucide/svelte/icons/info";
   import X from "@lucide/svelte/icons/x";
+  import { flip } from "svelte/animate";
+  import { fly } from "svelte/transition";
   import { toasts } from "$lib/stores/toasts.svelte";
+  import { easeOut, ms } from "$lib/util/motion";
 </script>
 
 <div class="toasts" aria-live="polite">
@@ -10,6 +13,9 @@
     <div
       class="toast {t.tone}"
       role={t.tone === "error" ? "alert" : "status"}
+      in:fly={{ y: 10, duration: ms(180), easing: easeOut }}
+      out:fly={{ x: 28, duration: ms(140), easing: easeOut }}
+      animate:flip={{ duration: ms(180), easing: easeOut }}
       onpointerenter={() => toasts.hold(t.id)}
       onpointerleave={() => toasts.release(t.id)}
     >
@@ -49,7 +55,6 @@
     border-radius: var(--r-popover);
     background: var(--bg-popover);
     box-shadow: var(--shadow-popover);
-    animation: rise 0.16s ease-out;
   }
   .icon { flex: none; padding-top: 1px; color: var(--accent); }
   .error .icon { color: var(--danger); }
@@ -59,5 +64,4 @@
   .action { align-self: flex-start; margin-top: 4px; color: var(--accent); font-weight: 550; font-size: var(--fs-secondary); }
   .close { flex: none; align-self: flex-start; display: grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; color: var(--fg-tertiary); }
   .close:hover { background: var(--bg-hover); color: var(--fg-primary); }
-  @keyframes rise { from { transform: translateY(6px); opacity: 0; } }
 </style>

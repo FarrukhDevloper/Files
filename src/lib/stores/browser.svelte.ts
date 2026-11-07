@@ -3,11 +3,13 @@
 // methods; file operations live in $lib/actions.
 
 import { api } from "$lib/ipc/api";
-import type { Entry, Location, VfsError } from "$lib/ipc/types";
+import type { Entry, GitInfo, Location, VfsError } from "$lib/ipc/types";
 import { toVfsError } from "$lib/util/errors";
 import { kindLabel } from "$lib/util/filetype";
-import { ancestors, baseName, isRoot, parentPath, sameLocation, sameSource, sourceLabel } from "$lib/util/path";
+import { ancestors, baseName, isRoot, parentPath, sameLocation, sameSource, sourceKey, sourceLabel } from "$lib/util/path";
 import { hosts } from "./hosts.svelte";
+import { listings, sameListing } from "./listings";
+import { ms } from "$lib/util/motion";
 import { prefs, type Sort, type SortKey, type ViewMode } from "./prefs.svelte";
 import { toasts } from "./toasts.svelte";
 
@@ -39,13 +41,40 @@ export interface GoOptions {
 /** A history entry: a folder, or null for the Home start page. */
 export type Stop = Location | null;
 
+/** Last git state per folder, so a revisit shows its badges at once. */
+const gitCache = new Map<string, GitInfo | null>();
+const GIT_CACHE_MAX = 200;
+
+interface ShowContext { here: Stop | undefined; from: Location | null; opts: GoOptions }
+
+/** Into a subfolder = 1, out to an ancestor = -1, anything else = 0. */
+function direction(from: Location | null, to: Location): -1 | 0 | 1 {
+  if (!from || !sameSource(from.source, to.source)) return 0;
+  if (ancestors(to.path).includes(from.path)) return 1;
+  if (ancestors(from.path).includes(to.path)) return -1;
+  return 0;
+}
+
 export class Browser {
   /** null while the Home start page is shown (or before the first listing). */
   location = $state.raw<Location | null>(null);
   /** Showing the Home start page (servers, drives) instead of a folder. */
   home = $state(false);
   entries = $state.raw<Entry[]>([]);
+  /** Waiting for a folder that isn't cached yet (the old one stays shown). */
   loading = $state(false);
+  /** Re-listing the shown folder in the background. */
+  refreshing = $state(false);
+  /** Items still being copied/moved here (dimmed until the job is done). */
+  pending = $state.raw<ReadonlySet<string>>(new Set());
+  /** Just added (rows animate in) / about to go (rows animate out). */
+  fresh = $state.raw<ReadonlySet<string>>(new Set());
+  leaving = $state.raw<ReadonlySet<string>>(new Set());
+  /** Git state of the shown folder; null outside a repository (or unknown). */
+  git = $state.raw<GitInfo | null>(null);
+  /** Direction of the last navigation, for the view transition:
+   *  1 = deeper/forward, -1 = up/back, 0 = elsewhere. */
+  navDir: -1 | 0 | 1 = 0;
   /** Set when the current folder couldn't be listed (shown in place of the list). */
   error = $state.raw<VfsError | null>(null);
   backStack = $state.raw<Stop[]>([]);
@@ -93,6 +122,11 @@ export class Browser {
 
   #anchor: string | null = null;
   #seq = 0;
+  #dirHint: -1 | 1 | null = null;
+  #gitSeq = 0;
+  #freshTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Navigation generation, bumped by every navigation the user starts. */
+  #nav = 0;
   #revealSeq = 0;
   #typed = "";
   #typedAt = 0;
@@ -103,14 +137,33 @@ export class Browser {
   /** Where we are, as a history entry; undefined before anything was shown. */
   get #here(): Stop | undefined { return this.home ? null : this.location ?? undefined; }
 
+  /** Claim the next navigation before a slow step (connecting, stat). Pass
+   *  the token to isCurrentNav() afterwards: if the user went anywhere else
+   *  in the meantime, the late result must not pull them back. */
+  claimNav(): number {
+    // A listing still in flight is superseded too.
+    this.#seq++;
+    this.loading = false;
+    return ++this.#nav;
+  }
+
+  isCurrentNav(token: number): boolean {
+    return token === this.#nav;
+  }
+
   /** Show the Home start page. */
   showHome(opts: Pick<GoOptions, "history"> = {}) {
     this.#seq++;
+    this.#nav++;
     const here = this.#here;
     if (!this.home && here !== undefined && (opts.history ?? "push") === "push") {
       this.backStack = [...this.backStack, here].slice(-100);
       this.forwardStack = [];
     }
+    this.navDir = this.#dirHint ?? 0;
+    this.#dirHint = null;
+    this.#gitSeq++;
+    this.git = null;
     this.home = true;
     this.location = null;
     this.entries = [];
@@ -131,51 +184,36 @@ export class Browser {
     return this.go(stop, { history: "none" });
   }
 
-  /** List `loc` and show it. Resolves false if it failed or was superseded. */
+  /** Show `loc`. A cached listing shows at once and is refreshed in the
+   *  background; otherwise the current folder stays until the new one is
+   *  listed. Resolves false if it failed or was superseded. */
   async go(loc: Location, opts: GoOptions = {}): Promise<boolean> {
     const seq = ++this.#seq;
-    const here = this.#here;
-    const from = this.location;
-    const same = sameLocation(loc, from);
-    this.loading = true;
+    this.#nav++;
+    const ctx: ShowContext = { here: this.#here, from: this.location, opts };
+    const same = sameLocation(loc, ctx.from);
+    if (!same) {
+      const cached = listings.get(loc);
+      if (cached) {
+        this.loading = false;
+        this.#show(loc, cached, ctx);
+        void this.#revalidate(loc, seq);
+        return true;
+      }
+    }
+    // Re-listing the shown folder doesn't block it.
+    if (same) this.refreshing = true;
+    else this.loading = true;
     try {
       const list = await this.#list(loc, seq);
       if (list === null) return false;
-
-      if (!same && here !== undefined && (opts.history ?? "push") === "push") {
-        this.backStack = [...this.backStack, here].slice(-100);
-        this.forwardStack = [];
-      }
-      this.home = false;
-      this.location = loc;
-      this.entries = list;
-      this.error = null;
-
-      if (same) {
-        this.refreshCount++;
-        const alive = new Set(list.map((e) => e.path));
-        this.selected = new Set([...this.selected].filter((p) => alive.has(p)));
-        if (this.cursor && !alive.has(this.cursor)) this.cursor = null;
-        if (this.renaming && !alive.has(this.renaming)) this.renaming = null;
-        if (opts.select) this.selectOnly(opts.select);
-      } else {
-        this.listingId++;
-        this.filter = "";
-        this.renaming = null;
-        // Going up: select the folder we came out of, like Finder.
-        let select = opts.select;
-        if (select === undefined && from && sameSource(from.source, loc.source)) {
-          const chain = ancestors(from.path);
-          const at = chain.indexOf(loc.path);
-          select = at >= 0 ? chain[at + 1] ?? null : null;
-        }
-        this.selectOnly(select ?? null);
-      }
+      if (same) this.#merge(list, { force: true, select: opts.select });
+      else this.#show(loc, list, ctx);
       return true;
     } catch (e) {
       if (seq !== this.#seq) return false;
       const label = baseName(loc.path) || sourceLabel(loc.source);
-      if (!from && !this.home) {
+      if (!ctx.from && !this.home) {
         // Nothing to stay on: show the error in place of the listing.
         this.location = loc;
         this.entries = [];
@@ -186,20 +224,114 @@ export class Browser {
       }
       return false;
     } finally {
-      if (seq === this.#seq) this.loading = false;
+      if (seq === this.#seq) {
+        this.loading = false;
+        this.refreshing = false;
+      }
+    }
+  }
+
+  /** Display a new folder's listing (history, selection, view reset). */
+  #show(loc: Location, list: Entry[], { here, from, opts }: ShowContext) {
+    if (here !== undefined && (opts.history ?? "push") === "push") {
+      this.backStack = [...this.backStack, here].slice(-100);
+      this.forwardStack = [];
+    }
+    this.navDir = this.#dirHint ?? direction(from, loc);
+    this.#dirHint = null;
+    this.home = false;
+    this.location = loc;
+    this.entries = list;
+    this.pending = new Set();
+    this.fresh = new Set();
+    this.leaving = new Set();
+    this.error = null;
+    this.listingId++;
+    this.filter = "";
+    this.renaming = null;
+    // Going up: select the folder we came out of, like Finder.
+    let select = opts.select;
+    if (select === undefined && from && sameSource(from.source, loc.source)) {
+      const chain = ancestors(from.path);
+      const at = chain.indexOf(loc.path);
+      select = at >= 0 ? chain[at + 1] ?? null : null;
+    }
+    this.selectOnly(select ?? null);
+    this.#loadGit(loc);
+  }
+
+  /** Git status for the shown folder, alongside its listing (never blocks it). */
+  #loadGit(loc: Location) {
+    const seq = ++this.#gitSeq;
+    const key = `${sourceKey(loc.source)}|${loc.path}`;
+    this.git = gitCache.get(key) ?? null;
+    api.gitInfo(loc).then(
+      (info) => {
+        gitCache.delete(key);
+        gitCache.set(key, info);
+        if (gitCache.size > GIT_CACHE_MAX) gitCache.delete(gitCache.keys().next().value!);
+        if (seq === this.#gitSeq) this.git = info;
+      },
+      () => { if (seq === this.#gitSeq) this.git = null; },
+    );
+  }
+
+  /** A fresh listing of the shown folder: apply it in place (rows keyed by
+   *  path, scroll and selection kept). Unchanged listings change nothing. */
+  #merge(list: Entry[], { force = false, select }: { force?: boolean; select?: string | null } = {}) {
+    if (sameListing(this.entries, list) && !this.pending.size) {
+      if (force) {
+        this.refreshCount++;
+        if (this.location) this.#loadGit(this.location);
+      }
+    } else {
+      if (this.location) this.#loadGit(this.location);
+      const before = new Set(this.entries.map((e) => e.path));
+      this.#markFresh(list.filter((e) => !before.has(e.path)).map((e) => e.path));
+      this.entries = list;
+      this.pending = new Set();
+      this.refreshCount++;
+      const alive = new Set(list.map((e) => e.path));
+      if ([...this.selected].some((p) => !alive.has(p))) this.selected = new Set([...this.selected].filter((p) => alive.has(p)));
+      if (this.cursor && !alive.has(this.cursor)) this.cursor = null;
+      if (this.renaming && !alive.has(this.renaming)) this.renaming = null;
+    }
+    this.error = null;
+    if (select) this.selectOnly(select);
+  }
+
+  /** Background refresh after showing a cached listing. */
+  async #revalidate(loc: Location, seq: number) {
+    this.refreshing = true;
+    try {
+      const list = await this.#list(loc, seq);
+      if (list !== null) this.#merge(list);
+    } catch (e) {
+      if (seq !== this.#seq) return;
+      const err = toVfsError(e);
+      if (err.code === "not_found" || err.code === "not_a_directory" || err.code === "permission_denied") {
+        // The folder went away: say so instead of showing old contents.
+        listings.drop(loc);
+        this.entries = [];
+        this.error = err;
+        this.listingId++;
+      }
+      // Offline or slow: keep showing the cached listing.
+    } finally {
+      if (seq === this.#seq) this.refreshing = false;
     }
   }
 
   /** listDir, connecting first if the server dropped. null = superseded. */
   async #list(loc: Location, seq: number): Promise<Entry[] | null> {
     try {
-      const list = await api.listDir(loc);
+      const list = await listings.fetch(loc);
       return seq === this.#seq ? list : null;
     } catch (e) {
       if (loc.source.kind !== "ssh" || toVfsError(e).code !== "not_connected") throw e;
       await hosts.connect(loc.source.host);
       if (seq !== this.#seq) return null;
-      const list = await api.listDir(loc);
+      const list = await listings.fetch(loc);
       return seq === this.#seq ? list : null;
     }
   }
@@ -208,6 +340,7 @@ export class Browser {
     const target = this.backStack.at(-1);
     const from = this.#here;
     if (target === undefined || from === undefined) return;
+    this.#dirHint = -1;
     if (await this.#visit(target)) {
       this.backStack = this.backStack.slice(0, -1);
       this.forwardStack = [...this.forwardStack, from];
@@ -218,6 +351,7 @@ export class Browser {
     const target = this.forwardStack.at(-1);
     const from = this.#here;
     if (target === undefined || from === undefined) return;
+    this.#dirHint = 1;
     if (await this.#visit(target)) {
       this.forwardStack = this.forwardStack.slice(0, -1);
       this.backStack = [...this.backStack, from];
@@ -233,14 +367,10 @@ export class Browser {
     if (this.location) await this.go(this.location, { history: "none" });
   }
 
-  /** Disconnected/failed state: forget the listing but keep the place. */
-  invalidate(error: VfsError) {
-    this.#seq++;
-    this.loading = false;
-    this.entries = [];
-    this.error = error;
-    this.selected = new Set();
-    this.cursor = null;
+  /** The shown folder's listing changed elsewhere (transfer, reconnect):
+   *  re-list it quietly; nothing happens if it's the same. */
+  revalidate() {
+    if (this.location && !this.loading) void this.#revalidate(this.location, this.#seq);
   }
 
   // ---- view settings (per tab; defaults come from the Preferences sheet) ----
@@ -323,6 +453,8 @@ export class Browser {
     } else {
       this.selectOnly(entry.path);
     }
+    // Keyboard on a folder: list it ahead, Enter will likely follow.
+    if (entry.kind === "dir" && this.location) listings.prefetchSoon(this.locationOf(entry));
   }
 
   /** Type-to-select: letters typed within a second form a prefix. */
@@ -353,12 +485,40 @@ export class Browser {
 
   // ---- local edits after a successful command (no re-list round-trip) ----
 
-  addEntry(entry: Entry) {
-    this.entries = [...this.entries.filter((e) => e.path !== entry.path), entry];
+  /** Apply a local edit to folder `dir`: in this view if it shows it, and
+   *  in the listing cache (so a revisit isn't stale). */
+  #edit(dir: Location | null, fn: (list: Entry[]) => Entry[]) {
+    if (!dir) return;
+    if (sameLocation(this.location, dir)) this.entries = fn(this.entries);
+    listings.update(dir, fn);
   }
 
-  replaceEntry(oldPath: string, entry: Entry) {
-    this.entries = this.entries.map((e) => (e.path === oldPath ? entry : e));
+  addEntry(entry: Entry, dir = this.location) {
+    this.#edit(dir, (list) => [...list.filter((e) => e.path !== entry.path), entry]);
+    if (sameLocation(this.location, dir)) this.#markFresh([entry.path]);
+  }
+
+  /** Rows for these paths play their insert animation once. */
+  #markFresh(paths: string[]) {
+    if (!paths.length || paths.length > 50) return; // a big change is a new listing, not an insert
+    this.fresh = new Set([...this.fresh, ...paths]);
+    clearTimeout(this.#freshTimer);
+    this.#freshTimer = setTimeout(() => (this.fresh = new Set()), 400);
+  }
+
+  /** Items arriving from a transfer: shown dimmed until it settles. */
+  addPending(entries: Entry[], dir: Location) {
+    if (!sameLocation(this.location, dir)) return;
+    const fresh = entries.filter((e) => !this.index.has(e.path));
+    if (!fresh.length) return;
+    this.entries = [...this.entries, ...fresh];
+    this.pending = new Set([...this.pending, ...fresh.map((e) => e.path)]);
+    this.#markFresh(fresh.map((e) => e.path));
+  }
+
+  replaceEntry(oldPath: string, entry: Entry, dir = this.location) {
+    this.#edit(dir, (list) => list.map((e) => (e.path === oldPath ? entry : e)));
+    if (!sameLocation(this.location, dir)) return;
     if (this.selected.has(oldPath)) {
       const next = new Set(this.selected);
       next.delete(oldPath);
@@ -366,12 +526,26 @@ export class Browser {
       this.selected = next;
     }
     if (this.cursor === oldPath) this.cursor = entry.path;
+    if (this.renaming === oldPath) this.renaming = entry.path;
   }
 
-  removePaths(paths: readonly string[]) {
+  /** Remove rows; shown ones fade out first (`animate`, ~140 ms). */
+  removePaths(paths: readonly string[], dir = this.location, animate = false) {
+    const delay = animate && sameLocation(this.location, dir) ? ms(140) : 0;
+    if (delay) {
+      this.leaving = new Set([...this.leaving, ...paths]);
+      setTimeout(() => {
+        const left = new Set(paths);
+        this.leaving = new Set([...this.leaving].filter((p) => !left.has(p)));
+        this.removePaths(paths, dir);
+      }, delay);
+      return;
+    }
     const gone = new Set(paths);
-    const firstIndex = Math.min(...paths.map((p) => this.index.get(p) ?? Infinity));
-    this.entries = this.entries.filter((e) => !gone.has(e.path));
+    const showing = sameLocation(this.location, dir);
+    const firstIndex = showing ? Math.min(...paths.map((p) => this.index.get(p) ?? Infinity)) : Infinity;
+    this.#edit(dir, (list) => list.filter((e) => !gone.has(e.path)));
+    if (!showing) return;
     this.selectNone();
     this.cursor = null;
     if (Number.isFinite(firstIndex) && this.items.length > 0) this.moveTo(Math.min(firstIndex, this.items.length - 1));

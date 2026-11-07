@@ -32,6 +32,10 @@ pub enum VfsError {
     Auth(String),
     #[error("host key rejected: {0}")]
     HostKey(String),
+    /// A non-interactive connect stopped where it would have had to ask the
+    /// user (unknown host key, password, passphrase).
+    #[error("sign-in needed: {0}")]
+    SignInNeeded(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
     #[error("cancelled")]
@@ -55,6 +59,7 @@ impl VfsError {
             VfsError::NotConnected(_) => "not_connected",
             VfsError::Auth(_) => "auth",
             VfsError::HostKey(_) => "host_key",
+            VfsError::SignInNeeded(_) => "sign_in_needed",
             VfsError::Unsupported(_) => "unsupported",
             VfsError::Cancelled => "cancelled",
             VfsError::Io(_) => "io",

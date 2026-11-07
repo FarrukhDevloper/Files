@@ -5,7 +5,7 @@
 // real Rust backend answers.
 
 import type {
-  DiskSpace, EditSession, Entry, EventMap, HostDraft, HostInfo, JobSnapshot, Location, Place, SourceId,
+  DiskSpace, EditSession, Entry, EventMap, GitCommit, GitInfo, HostDraft, ServerInfo, HostInfo, JobSnapshot, Location, Place, SourceId,
   TextPreview, TransferRequest,
 } from "./types";
 
@@ -13,7 +13,9 @@ export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in
 
 export interface Api {
   listHosts(): Promise<HostInfo[]>;
-  connectHost(alias: string): Promise<void>;
+  /** `interactive: false` never prompts (auto-connect / background): it
+   * fails with code "cancelled" ("sign-in needed") instead. Default true. */
+  connectHost(alias: string, interactive?: boolean): Promise<void>;
   disconnectHost(alias: string): Promise<void>;
   /** Create (previousAlias = null) or update an app-managed server. */
   saveHost(draft: HostDraft, previousAlias: string | null): Promise<HostInfo>;
@@ -23,6 +25,16 @@ export interface Api {
   forgetPassword(alias: string): Promise<void>;
   /** Path of ~/.ssh/config, to open it in an editor with openExternal. */
   sshConfigPath(): Promise<string>;
+  /** Uptime, load, memory, OS of a connected server (one read-only exec). */
+  serverInfo(alias: string): Promise<ServerInfo>;
+  /** Open the OS terminal in this folder; on a server it runs ssh there. */
+  openTerminal(location: Location): Promise<void>;
+
+  /** Git state for a folder; null when it is not inside a repo or git is
+   * not installed (locally, or on that server). */
+  gitInfo(location: Location): Promise<GitInfo | null>;
+  /** Newest-first history touching `location` (a folder or a file). */
+  gitLog(location: Location, limit: number): Promise<GitCommit[]>;
 
   localPlaces(): Promise<Place[]>;
   homeDir(source: SourceId): Promise<string>;
@@ -75,12 +87,16 @@ async function tauriApi(): Promise<Api> {
   const { listen } = await import("@tauri-apps/api/event");
   return {
     listHosts: () => invoke("list_hosts"),
-    connectHost: (alias) => invoke("connect_host", { alias }),
+    connectHost: (alias, interactive) => invoke("connect_host", { alias, interactive: interactive ?? true }),
     disconnectHost: (alias) => invoke("disconnect_host", { alias }),
     saveHost: (draft, previousAlias) => invoke("save_host", { draft, previousAlias }),
     removeHost: (alias) => invoke("remove_host", { alias }),
     forgetPassword: (alias) => invoke("forget_password", { alias }),
     sshConfigPath: () => invoke("ssh_config_path"),
+    serverInfo: (alias) => invoke("server_info", { alias }),
+    openTerminal: (location) => invoke("open_terminal", { location }),
+    gitInfo: (location) => invoke("git_info", { location }),
+    gitLog: (location, limit) => invoke("git_log", { location, limit }),
 
     localPlaces: () => invoke("local_places"),
     homeDir: (source) => invoke("home_dir", { source }),

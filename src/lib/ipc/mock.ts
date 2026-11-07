@@ -5,7 +5,8 @@
 
 import type { Api } from "./api";
 import type {
-  ConnStatus, EditSession, EditState, Entry, EventMap, HostInfo, JobSnapshot, Location, Place,
+  ConnStatus, EditSession, EditState, Entry, EventMap, GitCommit, GitFileStatus, GitInfo, HostInfo, JobSnapshot,
+  Location, Place, ServerInfo,
   PromptRequest, SourceId, VfsError,
 } from "./types";
 
@@ -34,7 +35,12 @@ const trees = new Map<string, Node>([
         Documents: dir({
           "invoice-2026-10.pdf": file(98_220, 9),
           "notes.txt": file(5_311, 2),
-          Projects: dir({ "vps-files": dir({ "README.md": file(2_048) }) }),
+          // A git repository (see mockGit below).
+          Projects: dir({ "vps-files": dir({
+            "README.md": file(2_048), "package.json": file(1_204, 9), ".gitignore": file(96, 40), "notes.md": file(512, 0),
+            src: dir({ "main.ts": file(3_200, 6), "new-view.svelte": file(4_310, 0), lib: dir({ "api.ts": file(5_100, 0), "path.ts": file(2_200, 12) }) }),
+            docs: dir({ "DESIGN.md": file(6_000, 1), "IPC.md": file(9_800, 3) }),
+          }) }),
           // Exercises list virtualization: 10k entries must scroll at 60 fps.
           "10k files": dir(Object.fromEntries(Array.from({ length: 10_000 }, (_, i) =>
             [`log-${String(i).padStart(5, "0")}.txt`, file(1_000 + ((i * 7919) % 900_000), i % 400)]))),
@@ -84,7 +90,7 @@ const hosts: (Omit<HostInfo, "status" | "origin" | "hasSavedSecret"> & { origin?
 ];
 trees.set("ssh:demo-pass", dir({ root: dir({ "notes.txt": file(812) }), etc: dir({ hostname: file(12) }) }));
 const homes: Record<string, string> = { local: "/home/me", "ssh:demo-web": "/home/deploy", "ssh:demo-db": "/home/admin", "ssh:demo-pass": "/root" };
-const trustedHosts = new Set(["demo-web", "demo-pass", "demo-down"]);
+const trustedHosts = new Set(["demo-web", "demo-pass", "demo-down", "lab"]);
 type Answer = { accept: boolean; secret: string | null; remember: boolean };
 const pendingPrompts = new Map<string, (answer: Answer) => void>();
 /** The "OS keychain": passwords saved per host alias. */
@@ -243,6 +249,86 @@ function setJobState(id: string, state: JobSnapshot["state"]) {
   emit("transfer:update", next);
 }
 
+// ---- git: one local repository with local changes and history ----
+
+const REPO = "/home/me/Documents/Projects/vps-files";
+/** Repo-relative path → status (what `git status --porcelain=v2` would say). */
+const repoChanges: Record<string, GitFileStatus> = {
+  "README.md": "modified",
+  "src/lib/api.ts": "modified",
+  "src/new-view.svelte": "added",
+  "docs/DESIGN.md": "renamed",
+  "notes.md": "untracked",
+};
+const STRENGTH: GitFileStatus[] = ["untracked", "added", "renamed", "modified", "deleted", "conflicted"];
+
+function mockGitInfo(loc: Location): GitInfo | null {
+  if (loc.source.kind !== "local" || !(loc.path === REPO || loc.path.startsWith(`${REPO}/`))) return null;
+  const rel = loc.path.slice(REPO.length + 1);
+  const entries: Record<string, GitFileStatus> = {};
+  for (const [path, status] of Object.entries(repoChanges)) {
+    if (rel && !path.startsWith(`${rel}/`)) continue;
+    const name = (rel ? path.slice(rel.length + 1) : path).split("/")[0]!;
+    const had = entries[name];
+    // A folder shows the strongest status of anything below it.
+    if (!had || STRENGTH.indexOf(status) > STRENGTH.indexOf(had)) entries[name] = status;
+  }
+  return {
+    root: REPO, branch: "main", head: "3f9c2ab", upstream: "origin/main", ahead: 2, behind: 1,
+    remoteUrl: "git@github.com:example/vps-files.git", webUrl: "https://github.com/example/vps-files",
+    changed: Object.keys(repoChanges).length, entries,
+  };
+}
+
+const SUBJECTS = [
+  "Address bar: fold leading crumbs into a menu", "Thumbnails: separate local/remote gates",
+  "Listing cache with stale-while-revalidate", "Fix: late connect must not navigate",
+  "Quiet auto-connect at startup", "Home page with server cards", "Add/Edit server sheet",
+  "Open remote files in local apps", "Edit sessions: conflict sheet", "Dual pane (F3)",
+  "Animation pass: transform/opacity only", "Quick Look zooms from the item", "Optimistic rename and delete",
+  "Column view reads the shared cache", "Bump russh to 0.54", "SFTP: pipeline READDIR",
+  "Media server: thumbnail route", "Keychain: remember passwords", "ProxyJump support",
+  "Transfers: merge conflict policy", "Preferences sheet", "Keyboard audit", "Tab strip",
+  "Drag & drop between folders", "Miller columns", "Conflict sheet for name clashes",
+  "List view: sticky header", "Icon view virtualization", "Initial architecture", "Initial commit",
+];
+
+function mockGitLog(loc: Location, limit: number): GitCommit[] {
+  if (!mockGitInfo(loc)) return [];
+  // A file has a shorter history than its repository.
+  const step = loc.path === REPO || lookupKind(loc) === "dir" ? 1 : 3;
+  const out: GitCommit[] = [];
+  for (let i = 0; i < SUBJECTS.length && out.length < limit; i += step) {
+    const hash = Array.from({ length: 40 }, (_, k) => "0123456789abcdef"[(i * 7 + k * 13 + 3) % 16]).join("");
+    const refs = i === 0 ? ["HEAD -> main"] : i === 2 ? ["origin/main"] : i === 9 ? ["tag: v0.2.0"] : i === 22 ? ["tag: v0.1.0"] : [];
+    out.push({
+      hash, shortHash: hash.slice(0, 7), author: i % 3 === 1 ? "CI Bot" : "Farrukh", email: "dev@example.com",
+      date: now - i * 9 * 3_600_000 - 1_800_000, subject: SUBJECTS[i]!, refs,
+    });
+  }
+  return out;
+}
+
+function lookupKind(loc: Location): Node["kind"] | null {
+  try { return lookup(loc).kind; } catch { return null; }
+}
+
+/** Plausible health numbers, different per server. */
+function mockServerInfo(alias: string): ServerInfo {
+  const n = [...alias].reduce((a, c) => a + c.charCodeAt(0), 0);
+  const gb = 1024 ** 3;
+  const total = [4, 8, 16, 32][n % 4]! * gb;
+  return {
+    os: n % 2 ? "Ubuntu 24.04.1 LTS" : "Debian GNU/Linux 12 (bookworm)",
+    kernel: n % 2 ? "6.8.0-45-generic" : "6.1.0-25-amd64",
+    uptimeSecs: 3_600 * (20 + (n * 37) % 900),
+    load: [((n % 9) + 1) / 10, ((n % 7) + 1) / 10, ((n % 5) + 1) / 10],
+    cpus: [2, 4, 8][n % 3]!,
+    memTotal: total,
+    memAvailable: total * (0.25 + ((n % 50) / 100)),
+  };
+}
+
 // ---- edit sessions: a remote file "open in its app" ----
 // downloading → open → (a save) uploading → synced. On demo-db somebody else
 // changes the file meanwhile, so the save ends in "conflict".
@@ -277,7 +363,7 @@ export function createMockApi(): Api {
     async listHosts() {
       return hosts.map((h) => ({ ...h, origin: h.origin ?? "sshConfig", hasSavedSecret: keychain.has(h.alias), status: status.get(h.alias)! }));
     },
-    async connectHost(alias) {
+    async connectHost(alias, interactive = true) {
       if (!status.has(alias)) fail("not_found", alias);
       status.set(alias, { state: "connecting" });
       emit("conn:status", { host: alias, status: { state: "connecting" } });
@@ -288,7 +374,10 @@ export function createMockApi(): Api {
         throw error;
       };
       if (alias === "demo-down") failWith({ code: "io", message: "connect to 203.0.113.40 port 22: Connection timed out" });
+      // Not interactive (startup / background): never prompt, just report.
+      const signIn = (what: string): never => failWith({ code: "sign_in_needed", message: `sign-in needed: ${what}` });
       if (!trustedHosts.has(alias)) {
+        if (!interactive) signIn("unknown host key");
         const answer = await ask({
           kind: "hostKey", id: crypto.randomUUID(), host: alias, algorithm: "ED25519",
           fingerprint: "SHA256:q3Vn1dHkPZ0rM9yQe5o8wXkz7cB2fTgLjA4sU6vN1hE",
@@ -300,6 +389,7 @@ export function createMockApi(): Api {
         const saved = keychain.get(alias);
         if (saved !== undefined && !passwordOk(alias, saved)) keychain.delete(alias); // stale: ask again
         if (!keychain.has(alias)) {
+          if (!interactive) signIn("password");
           const user = hosts.find((h) => h.alias === alias)?.user ?? "root";
           const answer = await ask({ kind: "password", id: crypto.randomUUID(), host: alias, user });
           if (!answer.accept) failWith({ code: "cancelled", message: "Password prompt cancelled" });
@@ -362,6 +452,26 @@ export function createMockApi(): Api {
     async forgetPassword(alias) {
       if (!status.has(alias)) fail("not_found", alias);
       keychain.delete(alias);
+    },
+    // Lead stubs for round 3 — the ui agent turns them into realistic data.
+    async serverInfo(alias) {
+      requireConnected({ kind: "ssh", host: alias });
+      await latency({ kind: "ssh", host: alias });
+      return mockServerInfo(alias);
+    },
+    async openTerminal(loc) {
+      requireConnected(loc.source);
+      console.info("[mock] open terminal:", loc);
+    },
+    async gitInfo(loc) {
+      requireConnected(loc.source);
+      await latency(loc.source);
+      return mockGitInfo(loc);
+    },
+    async gitLog(loc, limit) {
+      requireConnected(loc.source);
+      await sleep(loc.source.kind === "local" ? 40 : 250);
+      return mockGitLog(loc, limit);
     },
     async sshConfigPath() {
       return "/home/me/.ssh/config";

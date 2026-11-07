@@ -10,10 +10,11 @@
   import { wantsThumbnail } from "$lib/thumbs.svelte";
   import { itemPointer } from "./itemPointer";
   import { backgroundMenu, commitRename, entryMenu, openEntry } from "$lib/actions";
-  import { api } from "$lib/ipc/api";
-  import type { Entry } from "$lib/ipc/types";
+  import type { Entry, Location } from "$lib/ipc/types";
   import { sortEntries, type Browser } from "$lib/stores/browser.svelte";
   import { clipboard } from "$lib/stores/clipboard.svelte";
+  import { listings, sameListing } from "$lib/stores/listings";
+  import { tabs } from "$lib/stores/tabs.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { toVfsError, errorTitle } from "$lib/util/errors";
   import { formatDate, formatSize } from "$lib/util/format";
@@ -32,9 +33,11 @@
     return sortEntries(b.showHidden ? list : list.filter((e) => !e.isHidden), b.sort);
   }
 
-  // ---- ancestor listings: cached per source, dropped on refresh ----
+  // ---- ancestor listings: shown from the listing cache at once, then
+  // re-listed (again after a refresh); cleared when the source changes ----
 
   let cache = $state.raw(new Map<string, Entry[] | { error: string }>());
+  let cacheSrc = "";
   let cacheKey = "";
   const pending = new Set<string>();
 
@@ -44,20 +47,34 @@
     const loc = b.location;
     if (!loc) return;
     untrack(() => {
-      if (key !== cacheKey) {
-        cacheKey = key;
+      const fresh = key !== cacheKey;
+      if (srcKey !== cacheSrc) {
+        cacheSrc = srcKey;
         cache = new Map();
+      }
+      if (fresh) {
+        cacheKey = key;
         pending.clear();
       }
+      let seeded: Map<string, Entry[] | { error: string }> | null = null;
       for (const path of need) {
-        if (cache.has(path) || pending.has(path)) continue;
+        if (pending.has(path) || (!fresh && cache.has(path))) continue;
+        const at: Location = { source: loc.source, path };
+        const known = listings.get(at);
+        if (known && cache.get(path) !== known) (seeded ??= new Map(cache)).set(path, known);
         pending.add(path);
         const forKey = key;
-        api.listDir({ source: loc.source, path }).then(
-          (list) => { if (cacheKey === forKey) cache = new Map(cache).set(path, list); },
-          (e) => { if (cacheKey === forKey) cache = new Map(cache).set(path, { error: errorTitle(toVfsError(e).code) }); },
+        listings.fetch(at).then(
+          (list) => {
+            const shown = cache.get(path);
+            if (cacheKey === forKey && !(Array.isArray(shown) && sameListing(shown, list))) cache = new Map(cache).set(path, list);
+          },
+          (e) => {
+            if (cacheKey === forKey && !cache.has(path)) cache = new Map(cache).set(path, { error: errorTitle(toVfsError(e).code) });
+          },
         ).finally(() => pending.delete(path));
       }
+      if (seeded) cache = seeded;
     });
   });
 
@@ -87,13 +104,16 @@
       preview = null;
       return;
     }
-    preview = { path, entries: null, error: null };
+    const at: Location = { source: loc.source, path };
+    const known = untrack(() => listings.get(at)) ?? null;
+    preview = { path, entries: known, error: null };
     let live = true;
-    // Short delay so arrowing through folders doesn't list each one.
+    // Short delay so arrowing through folders doesn't list each one; a
+    // cached listing shows meanwhile and is only replaced if it changed.
     const t = setTimeout(() => {
-      api.listDir({ source: loc.source, path }).then(
-        (list) => { if (live) preview = { path, entries: list, error: null }; },
-        (e) => { if (live) preview = { path, entries: [], error: errorTitle(toVfsError(e).code) }; },
+      listings.fetch(at).then(
+        (list) => { if (live && !(known && sameListing(known, list))) preview = { path, entries: list, error: null }; },
+        (e) => { if (live && !known) preview = { path, entries: [], error: errorTitle(toVfsError(e).code) }; },
       );
     }, PREVIEW_DELAY);
     return () => {
@@ -173,9 +193,12 @@
       entries={b.items}
       {srcKey}
       source={b.location?.source ?? null}
-      active={ui.windowFocused}
+      active={ui.windowFocused && tabs.current === b}
       isSelected={(p) => b.selected.has(p)}
-      isCut={(p) => clipboard.cutKeys.has(cutPrefix + p)}
+      isCut={(p) => clipboard.cutKeys.has(cutPrefix + p) || b.pending.has(p)}
+      isFresh={(p) => b.fresh.has(p)}
+      gitStatus={(n) => b.git?.entries[n]}
+      isLeaving={(p) => b.leaving.has(p)}
       renaming={b.renaming}
       reveal={b.reveal?.path ?? null}
       revealSeq={b.reveal?.seq ?? 0}

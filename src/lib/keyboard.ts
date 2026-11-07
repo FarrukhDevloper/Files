@@ -3,7 +3,7 @@
 
 import {
   backgroundMenu, copySelection, deleteSelection, entryMenu, getInfo, goToFolder, newFolder, newTab, openPreferences,
-  openSelection, paste, startRename, toggleQuickLook,
+  openSelection, paste, startRename, toggleDualPane, toggleQuickLook, transferToOtherPane,
 } from "$lib/actions";
 import { prefs } from "$lib/stores/prefs.svelte";
 import { prompts } from "$lib/stores/prompts.svelte";
@@ -98,7 +98,10 @@ export function handleKeydown(e: KeyboardEvent) {
       case "PageUp": b.moveCursor(-pageSize(), e.shiftKey); break;
       case "Enter": void openSelection(b); break;
       case "F2": startRename(b); break;
-      case "F5": void b.refresh(); break;
+      case "F3": toggleDualPane(); break;
+      // Dual pane: copy / move to the other pane (commander style).
+      case "F5": if (tabs.split) void transferToOtherPane("copy"); else void b.refresh(); break;
+      case "F6": if (tabs.split) void transferToOtherPane("move"); else handled = false; break;
       case " ": toggleQuickLook(b); break;
       case "Backspace": void b.up(); break;
       case "Delete": void deleteSelection(b, e.shiftKey); break;

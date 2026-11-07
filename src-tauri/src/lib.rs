@@ -2,10 +2,12 @@
 //! backend broadcasts as window events. No file logic lives here.
 
 mod commands;
+mod git;
 mod open;
 mod players;
 mod prompter;
 mod state;
+mod terminal;
 
 use tauri::{Emitter, Manager};
 use tokio::sync::broadcast;
@@ -35,6 +37,7 @@ pub fn run() {
             commands::remove_host,
             commands::forget_password,
             commands::ssh_config_path,
+            commands::server_info,
             commands::local_places,
             commands::home_dir,
             commands::list_dir,
@@ -44,6 +47,9 @@ pub fn run() {
             commands::rename_path,
             commands::delete_paths,
             commands::read_text,
+            git::git_info,
+            git::git_log,
+            terminal::open_terminal,
             open::open_external,
             open::edit_list,
             open::edit_stop,

@@ -112,8 +112,11 @@
     border-radius: var(--r-popover);
     background: var(--bg-popover);
     box-shadow: var(--shadow-popover);
+    transform-origin: top left;
+    animation: menu-in var(--dur-fast) var(--ease-out);
   }
   .menu:focus-visible { outline: none; }
+  @keyframes menu-in { from { opacity: 0; transform: scale(0.96); } }
   .item {
     display: flex;
     align-items: center;

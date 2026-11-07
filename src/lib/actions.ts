@@ -1,6 +1,7 @@
 // User-level file operations shared by the keyboard, the context menu, the
 // toolbar and the views. Each one reports failures as toasts.
 
+import { tick } from "svelte";
 import { api } from "$lib/ipc/api";
 import type { Entry, HostInfo, Location, Place, SourceId, TransferOp } from "$lib/ipc/types";
 import type { Browser } from "$lib/stores/browser.svelte";
@@ -8,6 +9,7 @@ import { clipboard } from "$lib/stores/clipboard.svelte";
 import { edits } from "$lib/stores/edits.svelte";
 import type { DropTarget } from "$lib/stores/dnd.svelte";
 import { hosts } from "$lib/stores/hosts.svelte";
+import { listings } from "$lib/stores/listings";
 import { prefs } from "$lib/stores/prefs.svelte";
 import { tabs } from "$lib/stores/tabs.svelte";
 import { toasts } from "$lib/stores/toasts.svelte";
@@ -15,7 +17,7 @@ import { transfers } from "$lib/stores/transfers.svelte";
 import { ui, type ConflictAction, type MenuItem } from "$lib/stores/ui.svelte";
 import { previewKind } from "$lib/util/filetype";
 import { formatSize, plural } from "$lib/util/format";
-import { ancestors, baseName, isRoot, joinPath, parentPath, sameLocation, sameSource, sourceLabel } from "$lib/util/path";
+import { ancestors, baseName, isRoot, joinPath, parentPath, sameLocation, sameSource, sourceKey, sourceLabel } from "$lib/util/path";
 import { isMac, shortcutLabel } from "$lib/util/platform";
 
 const local: SourceId = { kind: "local" };
@@ -26,20 +28,23 @@ export async function openPlace(b: Browser, place: Place) {
   await b.go({ source: local, path: place.path });
 }
 
-/** Sidebar server click: connect if needed, then open the remote home. */
+/** Sidebar server click: connect if needed, then open the remote home —
+ *  unless the user went somewhere else while it was connecting. */
 export async function openHost(b: Browser, alias: string) {
   const source: SourceId = { kind: "ssh", host: alias };
+  const token = b.claimNav();
   try {
     await hosts.connect(alias);
   } catch (e) {
-    toasts.error(e, `Couldn't connect to “${alias}”`, { label: "Retry", run: () => void openHost(b, alias) });
+    if (b.isCurrentNav(token)) toasts.error(e, `Couldn't connect to “${alias}”`, { label: "Retry", run: () => void openHost(b, alias) });
     return;
   }
+  if (!b.isCurrentNav(token)) return;
   try {
     const home = await api.homeDir(source);
-    await b.go({ source, path: home });
+    if (b.isCurrentNav(token)) await b.go({ source, path: home });
   } catch (e) {
-    toasts.error(e, `Couldn't open “${alias}”`);
+    if (b.isCurrentNav(token)) toasts.error(e, `Couldn't open “${alias}”`);
   }
 }
 
@@ -51,6 +56,31 @@ export function openStart(b: Browser) {
 
 export function newTab(from: Browser = tabs.current) {
   openStart(tabs.open(from));
+}
+
+/** F3: two independent panes side by side; the new right pane starts in
+ *  the same folder. Again: back to one pane. */
+export function toggleDualPane() {
+  const from = tabs.primary;
+  const b = tabs.toggleSplit();
+  if (b) {
+    if (from.location) void b.go(from.location, { history: "none" });
+    else b.showHome({ history: "none" });
+  }
+  void tick().then(() => ui.focusFiles());
+}
+
+/** Dual pane F5 / F6: copy / move the selection into the other pane's folder. */
+export async function transferToOtherPane(op: TransferOp) {
+  const b = tabs.current;
+  const dest = tabs.other?.location;
+  const sel = b.selection;
+  if (!dest || !b.location || !sel.length) return;
+  if (sameLocation(b.location, dest)) {
+    toasts.info("Both panes show the same folder", "Open another folder in the other pane first.");
+    return;
+  }
+  await startTransfer(op, sel.map((e) => b.locationOf(e)), dest);
 }
 
 export async function openLocalHome(b: Browser) {
@@ -153,34 +183,68 @@ export function startRename(b: Browser) {
   b.revealPath(sel[0]!.path);
 }
 
+/** Folders being created (optimistic): a rename waits for the real one. */
+const creating = new Map<string, Promise<Entry | null>>();
+
+/** Optimistic: the new name shows at once and reverts if the server says no. */
 export async function commitRename(b: Browser, entry: Entry, newName: string) {
   b.renaming = null;
   const name = newName.trim();
-  if (!name || name === entry.name) return;
+  const dir = b.location;
+  if (!name || name === entry.name || !dir) return;
+  const showing = () => sameLocation(b.location, dir);
+  const shown: Entry = { ...entry, name, path: joinPath(dir.path, name), isHidden: name.startsWith(".") };
+  b.replaceEntry(entry.path, shown, dir);
+  if (showing()) b.selectOnly(shown.path);
   try {
-    const renamed = await api.renamePath(b.locationOf(entry), name);
-    b.replaceEntry(entry.path, renamed);
-    b.selectOnly(renamed.path);
+    const key = `${sourceKey(dir.source)}|${entry.path}`;
+    if (creating.has(key) && !(await creating.get(key))) {
+      b.removePaths([shown.path], dir); // the folder was never created
+      return;
+    }
+    const renamed = await api.renamePath({ source: dir.source, path: entry.path }, name);
+    b.replaceEntry(shown.path, renamed, dir);
   } catch (e) {
+    b.replaceEntry(shown.path, entry, dir);
+    if (showing()) b.selectOnly(entry.path);
     toasts.error(e, `Couldn't rename “${entry.name}”`);
   }
 }
 
+/** Optimistic: the folder appears in rename mode at once; it's created in
+ *  the background and removed again if that fails. */
 export async function newFolder(b: Browser) {
-  if (!b.location || b.error) return;
+  const dir = b.location;
+  if (!dir || b.error) return;
   const taken = new Set(b.entries.map((e) => e.name.toLocaleLowerCase()));
   let name = "untitled folder";
   for (let n = 2; taken.has(name); n++) name = `untitled folder ${n}`;
-  try {
-    const entry = await api.createDir({ source: b.location.source, path: joinPath(b.location.path, name) });
-    if (!b.showHidden && entry.isHidden) b.toggleHidden();
-    b.filter = "";
-    b.addEntry(entry);
-    b.selectOnly(entry.path);
-    b.renaming = entry.path;
-  } catch (e) {
-    toasts.error(e, "Couldn't create a folder");
-  }
+  const path = joinPath(dir.path, name);
+  const placeholder: Entry = {
+    name, path, kind: "dir", size: 0, modified: Date.now(), mode: 0o755, isSymlink: false, isHidden: false,
+  };
+  b.filter = "";
+  b.addEntry(placeholder, dir);
+  b.selectOnly(path);
+  b.renaming = path;
+  const key = `${sourceKey(dir.source)}|${path}`;
+  const done = api.createDir({ source: dir.source, path }).then(
+    (entry) => {
+      // A rename may already have replaced the placeholder; then it owns the entry.
+      if ((sameLocation(b.location, dir) ? b.entries : listings.get(dir) ?? []).some((e) => e === placeholder)) {
+        b.replaceEntry(path, entry, dir);
+      }
+      return entry;
+    },
+    (e) => {
+      if (b.renaming === path) b.renaming = null;
+      b.removePaths([path], dir);
+      toasts.error(e, "Couldn't create a folder");
+      return null;
+    },
+  );
+  creating.set(key, done);
+  void done.finally(() => creating.delete(key));
 }
 
 /** Local → Trash (no confirm, like Finder). Remote or `permanent` → confirm. */
@@ -201,13 +265,16 @@ export async function deleteSelection(b: Browser, permanent = false) {
     });
     if (!ok) return;
   }
+  const dir = b.location;
   const locs = sel.map((e) => b.locationOf(e));
+  // Optimistic: gone at once; a failure re-lists the folder.
+  b.removePaths(sel.map((e) => e.path), dir, true);
   try {
     await api.deletePaths(locs, remote || permanent);
-    b.removePaths(sel.map((e) => e.path));
   } catch (e) {
     toasts.error(e, `Couldn't delete ${what}`);
-    await b.refresh();
+    listings.drop(dir);
+    for (const t of tabs.all) if (sameLocation(t.location, dir)) t.revalidate();
   }
 }
 
@@ -251,7 +318,8 @@ export async function startTransfer(op: TransferOp, sources: Location[], dest: L
 
   let existing: Map<string, Entry>;
   try {
-    existing = new Map((await api.listDir(dest)).map((e) => [norm(e.name), e]));
+    // A cached listing is safe here: a clash it misses gets "keep both".
+    existing = new Map((listings.get(dest) ?? (await listings.fetch(dest))).map((e) => [norm(e.name), e]));
   } catch {
     // Can't look first: let the backend keep both, the safe default.
     return (await transfers.start({ op, sources, destDir: dest, conflict: "keepBoth" })) !== null;
@@ -291,11 +359,28 @@ export async function startTransfer(op: TransferOp, sources: Location[], dest: L
     }
   }
 
+  showArriving(groups.keepBoth.filter((s) => !(sameSource(s.source, dest.source) && parentPath(s.path) === dest.path)), dest);
   let started = false;
   if (groups.keepBoth.length) started = (await transfers.start({ op, sources: groups.keepBoth, destDir: dest, conflict: "keepBoth" })) !== null || started;
   if (groups.replace.length) started = (await transfers.start({ op, sources: groups.replace, destDir: dest, conflict: "overwrite" })) !== null || started;
   if (groups.merge.length) started = (await transfers.start({ op, sources: groups.merge, destDir: dest, conflict: "merge" })) !== null || started;
   return started;
+}
+
+/** Items copied/moved into `dest` without a name clash appear there at once,
+ *  dimmed; the job's end re-lists the folder (App: transfers.onSettled). */
+function showArriving(sources: Location[], dest: Location) {
+  if (!sources.length) return;
+  const arriving = sources.map((src): Entry => {
+    const name = baseName(src.path);
+    const parent = parentPath(src.path);
+    const known = parent !== null ? listings.get({ source: src.source, path: parent })?.find((e) => e.path === src.path) : undefined;
+    return {
+      name, path: joinPath(dest.path, name), kind: known?.kind ?? "file", size: known?.size ?? 0,
+      modified: known?.modified ?? Date.now(), mode: known?.mode ?? null, isSymlink: false, isHidden: name.startsWith("."),
+    };
+  });
+  for (const t of tabs.all) t.addPending(arriving, dest);
 }
 
 /** Drag & drop: same source moves, cross-source (or Ctrl/Alt) copies.
@@ -359,8 +444,9 @@ export function goToFolder() {
   ui.editAddress();
 }
 
-/** Address bar: absolute path, "~" = home of `source`. */
-export async function goToPath(b: Browser, source: SourceId, typed: string): Promise<boolean> {
+/** Address bar: absolute path, "~" = home of `source`. `token` comes from
+ *  b.claimNav() when the caller already waited (e.g. for a connection). */
+export async function goToPath(b: Browser, source: SourceId, typed: string, token = b.claimNav()): Promise<boolean> {
   let path = typed.trim();
   if (!path) return false;
   // Windows users paste "C:\Users\me"; the backend wants "C:/Users/me".
@@ -372,11 +458,13 @@ export async function goToPath(b: Browser, source: SourceId, typed: string): Pro
       toasts.error(e, "Couldn't find the home folder");
       return false;
     }
+    if (!b.isCurrentNav(token)) return false;
   }
   if (!isRoot(path)) path = path.replace(/\/+$/, "") || "/";
   const loc: Location = { source, path };
   try {
     const entry = await api.statPath(loc);
+    if (!b.isCurrentNav(token)) return false;
     if (entry.kind === "dir") return b.go(loc);
     const parent = parentPath(path);
     return parent !== null && b.go({ source, path: parent }, { select: path });
@@ -397,7 +485,10 @@ export function entryMenu(b: Browser, e: MouseEvent, entry: Entry) {
   const items: MenuItem[] = [
     { label: "Open", shortcut: "Enter", run: () => void openSelection(b) },
     ...(single ? openWithItems(b, sel[0]!) : []),
-    ...(dir ? [{ label: "Open in New Tab", run: () => void tabs.open(b, b.locationOf(dir)) }] : []),
+    ...(dir ? [
+      { label: "Open in New Tab", run: () => void tabs.open(b, b.locationOf(dir)) },
+      { label: "Open in Terminal", run: () => void openTerminalAt(b.locationOf(dir)) },
+    ] : []),
     { label: "Quick Look", shortcut: "Space", disabled: !single, run: () => toggleQuickLook(b) },
     { label: "Get Info", shortcut: shortcutLabel("Mod+I"), disabled: !single, run: () => getInfo(b) },
     "separator",
@@ -407,6 +498,11 @@ export function entryMenu(b: Browser, e: MouseEvent, entry: Entry) {
     { label: "Copy", shortcut: shortcutLabel("Mod+C"), run: () => copySelection(b, "copy") },
     { label: "Cut", shortcut: shortcutLabel("Mod+X"), run: () => copySelection(b, "move") },
     { label: pasteLabel(), shortcut: shortcutLabel("Mod+V"), disabled: clipboard.empty, run: () => void paste(b) },
+    ...(tabs.split && tabs.other?.location
+      ? ["separator" as const,
+        { label: "Copy to Other Pane", shortcut: "F5", run: () => void transferToOtherPane("copy") },
+        { label: "Move to Other Pane", shortcut: "F6", run: () => void transferToOtherPane("move") }]
+      : []),
     "separator",
     { label: "New Folder", shortcut: shortcutLabel("Mod+Shift+N"), run: () => void newFolder(b) },
     "separator",
@@ -434,10 +530,36 @@ export function backgroundMenu(b: Browser, e: MouseEvent) {
     })),
     "separator",
     { label: b.showHidden ? "Hide Hidden Files" : "Show Hidden Files", shortcut: shortcutLabel("Mod+H"), run: () => b.toggleHidden() },
+    ...(b.git && b.view === "list" ? [{ label: "Show Git Column", checked: prefs.gitColumn, run: () => (prefs.gitColumn = !prefs.gitColumn) }] : []),
+    "separator",
+    { label: "Open in Terminal", disabled: !b.location, run: () => b.location && void openTerminalAt(b.location) },
     { label: "Copy Path", run: () => void copyPath(b) },
     { label: "Refresh", shortcut: shortcutLabel("Mod+R"), run: () => void b.refresh() },
   ];
   ui.openMenu(e, items);
+}
+
+// ---- terminal ----
+
+/** The OS terminal in this folder; on a server, an ssh session there. */
+export async function openTerminalAt(loc: Location) {
+  try {
+    if (loc.source.kind === "ssh") await hosts.connect(loc.source.host);
+    await api.openTerminal(loc);
+  } catch (e) {
+    toasts.error(e, "Couldn't open a terminal");
+  }
+}
+
+/** A terminal on a server, in its home folder. */
+export async function openServerTerminal(alias: string) {
+  const source: SourceId = { kind: "ssh", host: alias };
+  try {
+    await hosts.connect(alias);
+    await api.openTerminal({ source, path: await api.homeDir(source) });
+  } catch (e) {
+    toasts.error(e, `Couldn't open a terminal on “${alias}”`);
+  }
 }
 
 export function hostMenu(b: Browser, e: MouseEvent, alias: string) {
@@ -450,6 +572,7 @@ export function hostMenu(b: Browser, e: MouseEvent, alias: string) {
     state === "connected" || state === "connecting"
       ? { label: "Disconnect", run: () => void disconnectHost(b, alias) }
       : { label: "Connect", run: () => void connectHost(alias) },
+    { label: "Open in Terminal", run: () => void openServerTerminal(alias) },
     "separator",
     app
       ? { label: "Edit Server…", run: () => editServer(alias) }
@@ -536,7 +659,8 @@ export async function removeServer(alias: string) {
     toasts.error(e, `Couldn't remove “${alias}”`);
     return;
   }
-  for (const t of tabs.list) {
+  listings.dropSource({ kind: "ssh", host: alias });
+  for (const t of tabs.all) {
     if (t.location?.source.kind === "ssh" && t.location.source.host === alias) openStart(t);
     t.backStack = t.backStack.filter((s) => !(s?.source.kind === "ssh" && s.source.host === alias));
     t.forwardStack = t.forwardStack.filter((s) => !(s?.source.kind === "ssh" && s.source.host === alias));

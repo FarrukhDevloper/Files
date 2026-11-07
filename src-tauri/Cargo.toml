@@ -19,6 +19,7 @@ vpsfiles-ssh.workspace = true
 vpsfiles-transfer.workspace = true
 vpsfiles-stream.workspace = true
 vpsfiles-edit.workspace = true
+vpsfiles-git.workspace = true
 tauri.workspace = true
 tauri-plugin-opener.workspace = true
 tauri-plugin-dialog.workspace = true

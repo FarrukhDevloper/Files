@@ -1,63 +1,13 @@
 //! Real HTTP over loopback against `LocalBackend` in a temp dir.
 
+mod common;
+
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use common::*;
 use vpsfiles_stream::{MediaOptions, MediaServer};
 use vpsfiles_vfs::local::{from_native, LocalBackend};
-use vpsfiles_vfs::{Backend, BackendResolver, Location, Result, SourceId, VfsError};
-
-struct LocalOnly(Arc<LocalBackend>);
-
-#[async_trait]
-impl BackendResolver for LocalOnly {
-    async fn backend(&self, source: &SourceId) -> Result<Arc<dyn Backend>> {
-        match source {
-            SourceId::Local => Ok(self.0.clone()),
-            other => Err(VfsError::NotConnected(other.to_string())),
-        }
-    }
-}
-
-struct Reply {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Reply {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
-    }
-}
-
-/// Minimal HTTP/1.1 client: one request per connection.
-async fn request(url: &str, method: &str, extra: &[(&str, &str)]) -> Reply {
-    let rest = url.strip_prefix("http://").unwrap();
-    let (authority, path) = rest.split_at(rest.find('/').unwrap());
-    let mut sock = tokio::net::TcpStream::connect(authority).await.unwrap();
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
-    for (k, v) in extra {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    req.push_str("\r\n");
-    sock.write_all(req.as_bytes()).await.unwrap();
-    let mut raw = Vec::new();
-    sock.read_to_end(&mut raw).await.unwrap();
-
-    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-    let head = String::from_utf8(raw[..split].to_vec()).unwrap();
-    let mut lines = head.split("\r\n");
-    let status = lines.next().unwrap().split(' ').nth(1).unwrap().parse().unwrap();
-    let headers = lines
-        .map(|l| {
-            let (k, v) = l.split_once(':').unwrap();
-            (k.trim().to_string(), v.trim().to_string())
-        })
-        .collect();
-    Reply { status, headers, body: raw[split + 4..].to_vec() }
-}
+use vpsfiles_vfs::{Location, SourceId};
 
 async fn setup() -> (tempfile::TempDir, String, MediaServer, Vec<u8>) {
     let dir = tempfile::tempdir().unwrap();
@@ -203,7 +153,12 @@ fn dims(body: &[u8]) -> (u32, u32) {
 
 async fn thumb_server(ffmpeg: Option<std::path::PathBuf>) -> (tempfile::TempDir, MediaServer) {
     let cache = tempfile::tempdir().unwrap();
-    let options = MediaOptions { thumb_cache: Some(cache.path().join("thumbs")), ffmpeg };
+    let options = MediaOptions {
+        thumb_cache: Some(cache.path().join("thumbs")),
+        shared_thumbnails: Some(cache.path().join("freedesktop")),
+        ffmpeg,
+        remote_exec: None,
+    };
     let server = MediaServer::start_with(Arc::new(LocalOnly(Arc::new(LocalBackend::new()))), options).await.unwrap();
     (cache, server)
 }

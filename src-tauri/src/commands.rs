@@ -4,7 +4,7 @@
 use serde::Serialize;
 use tauri::State;
 use tokio::io::AsyncReadExt;
-use vpsfiles_ssh::{ConnStatus, HostConfig, HostDraft};
+use vpsfiles_ssh::{ConnStatus, HostConfig, HostDraft, ServerInfo};
 use vpsfiles_transfer::{JobId, JobSnapshot, TransferRequest};
 use vpsfiles_vfs::{local, path, DiskSpace, Entry, Location, Place, Result, SourceId, VfsError};
 
@@ -66,9 +66,16 @@ pub fn ssh_config_path(state: State<'_, AppState>) -> String {
     state.ssh.config_path().display().to_string()
 }
 
+/// `interactive: false` (auto-connect) never prompts; it fails with
+/// `sign_in_needed` instead.
 #[tauri::command]
-pub async fn connect_host(state: State<'_, AppState>, alias: String) -> Result<()> {
-    state.ssh.backend(&alias).await.map(|_| ())
+pub async fn connect_host(state: State<'_, AppState>, alias: String, interactive: Option<bool>) -> Result<()> {
+    state.ssh.connect(&alias, interactive.unwrap_or(true)).await
+}
+
+#[tauri::command]
+pub async fn server_info(state: State<'_, AppState>, alias: String) -> Result<ServerInfo> {
+    state.ssh.server_info(&alias).await
 }
 
 #[tauri::command]

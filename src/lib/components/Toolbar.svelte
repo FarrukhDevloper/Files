@@ -13,7 +13,7 @@
   import EditsPopover from "./EditsPopover.svelte";
   import TrafficLights from "./TrafficLights.svelte";
   import TransfersPopover from "./TransfersPopover.svelte";
-  import { addServer, getInfo, goToFolder, newFolder, newTab, openPreferences } from "$lib/actions";
+  import { addServer, getInfo, goToFolder, newFolder, newTab, openPreferences, openTerminalAt, toggleDualPane } from "$lib/actions";
   import { edits } from "$lib/stores/edits.svelte";
   import { hosts } from "$lib/stores/hosts.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
@@ -37,6 +37,8 @@
       { label: "Get Info", shortcut: shortcutLabel("Mod+I"), disabled: b.selection.length !== 1, run: () => getInfo(b) },
       { label: "Go to Folder…", shortcut: shortcutLabel("Mod+L"), run: goToFolder },
       { label: "New Tab", shortcut: shortcutLabel("Mod+T"), run: () => newTab(b) },
+      { label: "Dual Pane", shortcut: "F3", checked: !!tabs.split, run: toggleDualPane },
+      { label: "Open in Terminal", disabled: !b.location, run: () => b.location && void openTerminalAt(b.location) },
       "separator",
       { label: b.showHidden ? "Hide Hidden Files" : "Show Hidden Files", shortcut: shortcutLabel("Mod+H"), disabled: b.home, run: () => b.toggleHidden() },
       { label: "Refresh", shortcut: shortcutLabel("Mod+R"), disabled: !b.location, run: () => void b.refresh() },
@@ -121,7 +123,7 @@
       <ArrowUpDown size={17} strokeWidth={1.8} />
       {#if transfers.active.length}
         <span class="badge">{transfers.active.length}</span>
-        <span class="bar"><span style:width="{Math.round(transfers.progress * 100)}%"></span></span>
+        <span class="bar"><span style:transform="scaleX({transfers.progress})"></span></span>
       {/if}
     </button>
     {#if ui.transfersOpen}<TransfersPopover />{/if}
@@ -192,7 +194,7 @@
     background: var(--progress-track);
     overflow: hidden;
   }
-  .bar span { display: block; height: 100%; background: var(--accent); }
+  .bar span { display: block; height: 100%; background: var(--accent); transform-origin: left; transition: transform 0.2s linear; }
   .search {
     display: flex;
     align-items: center;

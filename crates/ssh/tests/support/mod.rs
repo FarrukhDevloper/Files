@@ -17,7 +17,7 @@ use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::{PrivateKey, PublicKey};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId};
-use russh_sftp::extensions::Statvfs;
+use russh_sftp::extensions::{LimitsExtension, Statvfs};
 use russh_sftp::protocol::{
     Attrs, Data, ExtendedReply, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version,
 };
@@ -41,6 +41,11 @@ pub struct Counters {
     pub stats: AtomicUsize,
     pub readdirs: AtomicUsize,
     pub execs: AtomicUsize,
+    /// SFTP OPEN / CLOSE of files (not dirs).
+    pub opens: AtomicUsize,
+    /// Bytes answered to READs.
+    pub read_bytes: AtomicUsize,
+    pub closes: AtomicUsize,
 }
 
 pub struct ServerState {
@@ -48,6 +53,10 @@ pub struct ServerState {
     pub authorized: Mutex<Vec<PublicKey>>,
     pub allow_exec: Mutex<bool>,
     pub allow_forwarding: Mutex<bool>,
+    /// Answer READs with at most this many bytes (0 = what was asked).
+    pub max_read: AtomicUsize,
+    /// Hang up on new connections at once (server down).
+    pub refuse: AtomicBool,
     pub counters: Counters,
     sessions: Mutex<Vec<tokio::task::AbortHandle>>,
 }
@@ -75,6 +84,8 @@ impl TestServer {
             authorized: Mutex::new(Vec::new()),
             allow_exec: Mutex::new(true),
             allow_forwarding: Mutex::new(true),
+            max_read: AtomicUsize::new(0),
+            refuse: AtomicBool::new(false),
             counters: Counters::default(),
             sessions: Mutex::new(Vec::new()),
         });
@@ -82,6 +93,11 @@ impl TestServer {
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
                 st.counters.connections.fetch_add(1, Ordering::SeqCst);
+                if st.refuse.load(Ordering::SeqCst) {
+                    st.counters.closed.fetch_add(1, Ordering::SeqCst);
+                    drop(sock);
+                    continue;
+                }
                 let config = st.config.lock().unwrap().clone();
                 let handler = SshHandler { state: st.clone(), channels: HashMap::new() };
                 // The session talks through a pipe; aborting the pump drops
@@ -308,11 +324,23 @@ impl russh_sftp::server::Handler for FsSftp {
     async fn init(&mut self, _v: u32, _ext: HashMap<String, String>) -> Result<Version, Self::Error> {
         let mut v = Version::new();
         v.extensions.insert("statvfs@openssh.com".into(), "2".into());
+        v.extensions.insert("limits@openssh.com".into(), "1".into());
         Ok(v)
     }
 
-    /// Fixed numbers: 4 KiB fragments, 1000 total, 250 available.
+    /// statvfs: fixed numbers (4 KiB fragments, 1000 total, 250 available).
+    /// limits: what OpenSSH's sftp-server reports.
     async fn extended(&mut self, id: u32, request: String, _data: Vec<u8>) -> Result<Packet, Self::Error> {
+        if request == "limits@openssh.com" {
+            let l = LimitsExtension {
+                max_packet_len: 256 * 1024,
+                max_read_len: 256 * 1024 - 1024,
+                max_write_len: 256 * 1024 - 1024,
+                max_open_handles: 0,
+            };
+            let data = russh_sftp::ser::to_bytes(&l).map_err(|_| StatusCode::Failure)?.to_vec();
+            return Ok(Packet::ExtendedReply(ExtendedReply { id, data }));
+        }
         if request != "statvfs@openssh.com" {
             return Err(StatusCode::OpUnsupported);
         }
@@ -348,23 +376,29 @@ impl russh_sftp::server::Handler for FsSftp {
         }
         o.truncate(pflags.contains(OpenFlags::TRUNCATE));
         let file = o.open(&filename).map_err(io_status)?;
+        self.state.counters.opens.fetch_add(1, Ordering::SeqCst);
         Ok(Handle { id, handle: self.handle(Open::File { file, append }) })
     }
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
-        self.open.remove(&handle).ok_or(StatusCode::Failure)?;
+        if let Open::File { .. } = self.open.remove(&handle).ok_or(StatusCode::Failure)? {
+            self.state.counters.closes.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(ok(id))
     }
 
     async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
         let Some(Open::File { file, .. }) = self.open.get_mut(&handle) else { return Err(StatusCode::Failure) };
         file.seek(SeekFrom::Start(offset)).map_err(io_status)?;
-        let mut buf = vec![0; len as usize];
+        let cap = self.state.max_read.load(Ordering::SeqCst);
+        let len = if cap > 0 { (len as usize).min(cap) } else { len as usize };
+        let mut buf = vec![0; len];
         let n = file.read(&mut buf).map_err(io_status)?;
         if n == 0 {
             return Err(StatusCode::Eof);
         }
         buf.truncate(n);
+        self.state.counters.read_bytes.fetch_add(n, Ordering::SeqCst);
         Ok(Data { id, data: buf })
     }
 
@@ -454,6 +488,78 @@ impl russh_sftp::server::Handler for FsSftp {
         std::fs::rename(&old, &new).map_err(io_status)?;
         Ok(ok(id))
     }
+}
+
+// ---- latency ----------------------------------------------------------------
+
+/// A TCP proxy that delays every byte by `one_way` in each direction (no
+/// bandwidth limit), so round trips can be counted with wall time.
+pub struct LatencyProxy {
+    pub port: u16,
+}
+
+impl LatencyProxy {
+    pub async fn start(upstream: u16, one_way: Duration) -> Self {
+        Self::with_rate(upstream, one_way, None).await
+    }
+
+    /// Also cap each direction at `bytes_per_sec`, like a real link.
+    pub async fn with_rate(upstream: u16, one_way: Duration, bytes_per_sec: Option<u64>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(server) = tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await else { return };
+                    let _ = (client.set_nodelay(true), server.set_nodelay(true));
+                    let (cr, cw) = client.into_split();
+                    let (sr, sw) = server.into_split();
+                    tokio::spawn(delayed(cr, sw, one_way, bytes_per_sec));
+                    tokio::spawn(delayed(sr, cw, one_way, bytes_per_sec));
+                });
+            }
+        });
+        Self { port }
+    }
+}
+
+async fn delayed(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    delay: Duration,
+    rate: Option<u64>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    let writer = tokio::spawn(async move {
+        // When the link is free again.
+        let mut free = tokio::time::Instant::now();
+        while let Some((due, bytes)) = rx.recv().await {
+            let start = match rate {
+                Some(_) => due.max(free),
+                None => due,
+            };
+            tokio::time::sleep_until(start).await;
+            if to.write_all(&bytes).await.is_err() {
+                return;
+            }
+            if let Some(r) = rate {
+                free = start + Duration::from_secs_f64(bytes.len() as f64 / r as f64);
+            }
+        }
+        let _ = to.shutdown().await;
+    });
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        match from.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let _ = tx.send((tokio::time::Instant::now() + delay, buf[..n].to_vec()));
+            }
+        }
+    }
+    drop(tx);
+    let _ = writer.await;
 }
 
 // ---- client side helpers --------------------------------------------------
@@ -592,6 +698,8 @@ impl Home {
             default_identities: vec![self.path("id_ed25519")],
             keepalive: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
+            read_handle_idle: Duration::from_secs(15),
+            tuning: vpsfiles_ssh::SshTuning::default(),
         }
     }
 

@@ -14,6 +14,7 @@ const titles: Record<ErrorCode, string> = {
   not_connected: "Server not connected",
   auth: "Authentication failed",
   host_key: "Host key verification failed",
+  sign_in_needed: "Sign-in needed",
   unsupported: "Not supported",
   cancelled: "Cancelled",
   io: "Input/output error",
@@ -24,6 +25,7 @@ const hints: Partial<Record<ErrorCode, string>> = {
   host_key:
     "The server's key doesn't match ~/.ssh/known_hosts. Someone could be intercepting the connection — check with the server's admin before removing the old key.",
   auth: "The server didn't accept the key, passphrase or password.",
+  sign_in_needed: "Connect to it once to enter the password or confirm its key.",
   permission_denied: "You don't have access to this item.",
 };
 

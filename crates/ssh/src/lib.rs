@@ -11,15 +11,19 @@
 mod auth;
 pub mod config;
 mod hosts;
+mod info;
 mod known_hosts;
 mod manager;
 mod prompt;
 mod secrets;
 mod sftp;
+mod sftp_io;
+mod shell;
 
 pub use config::{HostConfig, HostOrigin};
 pub use hosts::HostDraft;
-pub use manager::{ConnEvent, ConnStatus, ExecOutput, SshManager, SshOptions};
+pub use info::ServerInfo;
+pub use manager::{ConnEvent, ConnStatus, ExecOutput, SshManager, SshOptions, SshTuning};
 pub use prompt::{Prompter, Secret};
 pub use secrets::{OsKeychain, SecretStore};
 pub use sftp::SftpBackend;

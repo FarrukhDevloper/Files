@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use vpsfiles_edit::EditManager;
 use vpsfiles_ssh::SshManager;
-use vpsfiles_stream::MediaServer;
+use vpsfiles_stream::{MediaOptions, MediaServer, RemoteExec};
 use vpsfiles_transfer::TransferManager;
 use vpsfiles_vfs::local::LocalBackend;
 use vpsfiles_vfs::{Backend, BackendResolver, Result, SourceId, VfsError};
@@ -42,11 +42,28 @@ impl AppState {
     }
 
     pub async fn media(&self) -> Result<&MediaServer> {
-        self.media.get_or_try_init(|| MediaServer::start(self.resolver.clone())).await
+        self.media
+            .get_or_try_init(|| {
+                // The server's own ffmpeg makes remote video thumbnails cheap.
+                let options =
+                    MediaOptions { remote_exec: Some(Arc::new(SshExec(self.ssh.clone()))), ..Default::default() };
+                MediaServer::start_with(self.resolver.clone(), options)
+            })
+            .await
     }
 
     pub async fn backend(&self, source: &SourceId) -> Result<Arc<dyn Backend>> {
         self.resolver.backend(source).await
+    }
+}
+
+struct SshExec(Arc<SshManager>);
+
+#[async_trait]
+impl RemoteExec for SshExec {
+    async fn exec(&self, host: &str, command: &str) -> Result<(u32, Vec<u8>)> {
+        let out = self.0.exec(host, command).await?;
+        Ok((out.exit_status, out.stdout))
     }
 }
 

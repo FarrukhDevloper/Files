@@ -6,6 +6,9 @@
   import Thumb from "./Thumb.svelte";
   import { wantsThumbnail } from "$lib/thumbs.svelte";
   import RenameField from "./RenameField.svelte";
+  import GitBadge from "./GitBadge.svelte";
+  import { gitLabel } from "$lib/util/git";
+  import { prefs } from "$lib/stores/prefs.svelte";
   import { itemPointer } from "./itemPointer";
   import { scrollMemory } from "./scrollMemory";
   import { backgroundMenu, commitRename, entryMenu } from "$lib/actions";
@@ -13,6 +16,7 @@
   import type { SortKey } from "$lib/stores/prefs.svelte";
   import { clipboard } from "$lib/stores/clipboard.svelte";
   import { dnd } from "$lib/stores/dnd.svelte";
+  import { tabs } from "$lib/stores/tabs.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { formatDate, formatSize } from "$lib/util/format";
   import { iconFor, kindLabel } from "$lib/util/filetype";
@@ -37,7 +41,8 @@
 
   const showDate = $derived(width === 0 || width > 520);
   const showKind = $derived(width === 0 || width > 720);
-  const columns = $derived(`minmax(0, 1fr)${showDate ? " 190px" : ""} 92px${showKind ? " 170px" : ""}`);
+  const showGit = $derived(prefs.gitColumn && !!b.git && (width === 0 || width > 600));
+  const columns = $derived(`minmax(0, 1fr)${showDate ? " 190px" : ""} 92px${showKind ? " 170px" : ""}${showGit ? " 96px" : ""}`);
   const srcKey = $derived(b.location ? sourceKey(b.location.source) : "");
   const cutPrefix = $derived(b.location ? `${srcKey}|` : "");
 
@@ -93,7 +98,7 @@
 
 <!-- The header lives inside the scroller (sticky) so it shares the rows'
      width — a vertical scrollbar can't shift the columns out of line. -->
-<div class="list" class:inactive={!ui.windowFocused} style:--cols={columns}>
+<div class="list" class:inactive={!ui.windowFocused || tabs.current !== b} style:--cols={columns}>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="viewport"
@@ -109,6 +114,7 @@
       {#if showDate}{@render sortHeader("modified", "Date Modified")}{/if}
       {@render sortHeader("size", "Size", "right")}
       {#if showKind}{@render sortHeader("kind", "Kind")}{/if}
+      {#if showGit}<div class="col">Git</div>{/if}
     </div>
     <div class="spacer" style:height="{b.items.length * ROW + PAD * 2}px" role="listbox" aria-multiselectable="true" aria-label="Files">
       {#each rows as entry, j (entry.path)}
@@ -124,8 +130,10 @@
           class:sel
           class:join-top={prevSel}
           class:join-bottom={nextSel}
-          class:cut={clipboard.cutKeys.has(cutPrefix + entry.path)}
+          class:cut={clipboard.cutKeys.has(cutPrefix + entry.path) || b.pending.has(entry.path)}
           class:hidden-file={entry.isHidden}
+          class:fresh={b.fresh.has(entry.path)}
+          class:leaving={b.leaving.has(entry.path)}
           style:top="{PAD + i * ROW}px"
           class:drop={dnd.target?.key === cutPrefix + entry.path}
           data-drop={entry.kind === "dir" ? "dir" : undefined}
@@ -150,11 +158,16 @@
               <RenameField {entry} oncommit={(name) => commitRename(b, entry, name)} oncancel={() => (b.renaming = null)} />
             {:else}
               <span class="name-text">{entry.name}</span>
+              {#if b.git?.entries[entry.name] && !showGit}<GitBadge status={b.git.entries[entry.name]!} />{/if}
             {/if}
           </div>
           {#if showDate}<div class="cell muted">{formatDate(entry.modified)}</div>{/if}
           <div class="cell muted right">{entry.kind === "dir" ? "—" : formatSize(entry.size)}</div>
           {#if showKind}<div class="cell muted">{kindLabel(entry)}</div>{/if}
+          {#if showGit}
+            {@const st = b.git?.entries[entry.name]}
+            <div class="cell git-col {st ?? ''}">{st ? gitLabel[st] : ""}</div>
+          {/if}
         </div>
       {/each}
     </div>
@@ -234,6 +247,9 @@
   .inactive .row.sel { background: var(--bg-sel-inactive); color: var(--fg-sel-inactive); }
   .row.drop { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
   .row.cut .cell, .row.hidden-file .cell { opacity: 0.55; }
+  .row.fresh { animation: row-in var(--dur) var(--ease-out); }
+  .row.leaving { opacity: 0; transform: translateX(-8px); transition: opacity 0.14s var(--ease-out), transform 0.14s var(--ease-out); }
+  @keyframes row-in { from { opacity: 0; transform: translateY(-6px); } }
 
   .cell {
     min-width: 0;
@@ -246,5 +262,14 @@
   .cell.name { display: flex; align-items: center; gap: 7px; padding-left: 6px; }
   .name-text { overflow: hidden; text-overflow: ellipsis; }
   .muted { color: var(--fg-secondary); }
+  .cell.name :global(.git) { margin-left: 2px; }
+  .row.sel .cell.name :global(.git) { color: inherit; }
+  .git-col { font-weight: 550; }
+  .git-col.modified { color: var(--git-modified); }
+  .git-col.added { color: var(--git-added); }
+  .git-col.untracked { color: var(--git-untracked); }
+  .git-col.renamed { color: var(--git-renamed); }
+  .git-col.deleted, .git-col.conflicted { color: var(--git-deleted); }
+  .row.sel .git-col { color: inherit; }
   .right { text-align: right; }
 </style>

@@ -104,7 +104,8 @@
     border-radius: var(--r-popover);
     background: var(--bg-popover);
     box-shadow: var(--shadow-popover);
-    animation: pop 0.12s ease-out;
+    transform-origin: top right;
+    animation: pop var(--dur-fast) var(--ease-out);
   }
   .popover:focus-visible { outline: none; }
   .head { padding: 10px 14px 6px; }
@@ -124,5 +125,5 @@
   .conflict .detail, .failed .detail { color: var(--danger); }
   .link { color: var(--accent); font-weight: 550; }
   .stop { flex: none; height: 24px; min-width: 24px; padding: 0; border-radius: 50%; }
-  @keyframes pop { from { transform: translateY(-4px); opacity: 0; } }
+  @keyframes pop { from { transform: translateY(-4px) scale(0.97); opacity: 0; } }
 </style>

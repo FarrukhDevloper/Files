@@ -29,6 +29,7 @@ crates/
   transfer/           TransferManager: queue, copy/move any→any, progress, pause/cancel
   stream/             MediaServer: HTTP Range streaming of any VFS file + thumbnails
   edit/               open remote files in local apps, sync saves back
+  git/                read-only git state + history via the git CLI (local or SSH exec)
 src-tauri/            Tauri shell: AppState, commands, event forwarding, UI prompter
 src/                  Svelte UI
   lib/ipc/            types.ts (contract), api.ts (typed invoke), mock.ts (browser backend)
@@ -124,6 +125,18 @@ the server copy changed since the last sync, nothing is written and the
 session goes to `conflict` until the user picks upload or discard. Media
 can instead be streamed to an external player (mpv, VLC, …) found on PATH
 or in the default Windows install folders.
+
+## Git and terminal
+
+`crates/git` runs the `git` CLI read-only (`GIT_OPTIONAL_LOCKS=0`, never
+takes the index lock): `rev-parse --show-toplevel --show-prefix`,
+`status --porcelain=v2 --branch -z`, `remote get-url origin`, `log`. On a
+server all commands go in **one** SSH exec as a base64-wrapped POSIX `sh`
+script, so the user's login shell (bash, zsh, fish…) never parses it.
+Credentials in https remotes are stripped before anything reaches the UI.
+"Open in Terminal" starts the OS terminal (Ptyxis, GNOME Console,
+gnome-terminal, Konsole, … / Windows Terminal) in the folder, or
+`ssh -t <host> 'cd <dir> && exec $SHELL -l'` for server folders.
 
 ## Lightness rules
 

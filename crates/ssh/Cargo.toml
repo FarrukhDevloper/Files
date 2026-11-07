@@ -24,3 +24,5 @@ keyring.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# examples/probe.rs: VPSFILES_TRACE=1
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }

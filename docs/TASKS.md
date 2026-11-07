@@ -206,3 +206,85 @@ and docs/IPC.md; Rust commands land as the backend pieces do.
 * Commands: hosts CRUD, edit_*, media_base, external_players /
   open_in_player (mpv, vlc, celluloid… on PATH; VLC default path on
   Windows), window-state plugin, contract docs.
+
+---
+
+# Round 3 — speed, smoothness, "like a local disk", git (user test feedback)
+
+User tested the app (dev build) against real servers and reported: folder
+opening and thumbnails are slow (Nautilus is instant with hundreds of
+images), connecting is slow, the app **jumped back to a server after it
+finished connecting** although they had navigated elsewhere, transfers and
+opening don't feel smooth, servers should auto-connect at startup and feel
+like local disks, more tasteful animation, and git integration like
+files-community/Files (branch, repo, history).
+
+Measured by lead (real server, read-only, RTT ≈ 130 ms):
+* TCP connect alone 0.4–4.6 s and OpenSSH itself needs 6.3 s → connect is
+  network/server bound; hide it (auto-connect, cached listings), don't fight it.
+* list home (47 entries) 450–900 ms ≈ 4–7 RTT → should be 2–3 RTT.
+* SFTP read 2.3 MiB/s (16 × 32 KiB in flight).
+* Server has ffmpeg + git; no ImageMagick.
+* Local: 200 × 6 MP JPEGs, visible thumbs in < 4 s in a debug build.
+Use `cargo run --release -p vpsfiles-ssh --example probe -- <alias> [file]`
+for before/after numbers (lead runs it against real hosts).
+
+## ssh agent (round 3) — backend speed
+1. **SFTP round trips**: listing in ≤ 2–3 RTT (pipeline READDIRs, close
+   without waiting, stat only symlinks). Build a latency-injecting TCP
+   proxy for tests (e.g. 100 ms each way) and assert RTT budgets per op
+   (connect, list, stat, small read, open_read+first byte).
+2. **Throughput**: 64 concurrent reads/writes, larger russh channel window
+   / packet size; report MiB/s through the 100 ms proxy before/after.
+3. **Handle reuse**: keep recently used read handles per (host, path) idle
+   for ~15 s so Range requests / seeks / thumbnail re-reads skip OPEN+CLOSE.
+4. **Thumbnails fast paths**: EXIF embedded JPEG thumbnail (read only the
+   first ~64–128 KiB) when it is big enough; scaled JPEG decode
+   (DCT scaling) otherwise; on Linux read **and** write the freedesktop
+   cache (`~/.cache/thumbnails/{normal,large}`, Thumb::URI/MTime) for local
+   files so Nautilus' thumbnails are instant here too; remote video frames
+   via the server's own ffmpeg over exec when present (fallback: local
+   ffmpeg over HTTP); separate limits for remote I/O (≈ 8) and CPU decode
+   (≈ cores); drop work when the HTTP client goes away; JPEG q≈75.
+5. **Auto-reconnect**: a connection that was up and drops reconnects in the
+   background with backoff (1, 2, 5, 15, 30 s cap), emitting status events;
+   no prompts during background reconnects (fail quietly instead).
+6. **Server info**: `SshManager::server_info(alias) -> ServerInfo` from one
+   read-only exec (/proc/loadavg, /proc/meminfo, nproc, /proc/uptime,
+   /etc/os-release, uname -r); fields optional; camelCase like types.ts.
+
+## ui agent (round 3) — feel
+1. **Bug**: connecting must never navigate if the user navigated (or
+   clicked something else) after starting it — navigation generation token.
+2. **Auto-connect** all servers at startup in parallel (Preference
+   "Connect to servers at startup", default on). Failures: red dot +
+   tooltip, no toast storm.
+3. **Instant navigation**: in-memory listing cache (LRU ~300 dirs) with
+   stale-while-revalidate (show cached at once, refresh in background, apply
+   the diff without flicker, keep scroll/selection); prefetch a folder's
+   listing on hover (150 ms) and when it is selected by keyboard;
+   optimistic updates for new folder / rename / delete / move+copy
+   results; spinner/skeleton only after 200 ms.
+4. **Thumbnails feel**: type icon immediately, thumbnail fades in, visible
+   first, abort when scrolled away, small sizes for rows (≤ 32 px × DPR),
+   remote ≤ 6 parallel / local ≤ 8.
+5. **Animation pass** (transform/opacity only, 120–220 ms, ease-out,
+   honour prefers-reduced-motion + a "Reduce motion" pref): direction-aware
+   folder transitions (back/forward), sheets/popovers/menus scale+fade,
+   Quick Look zooms from the item, list insert/remove, sidebar connecting
+   pulse, toasts, tabs open/close, hover lift on cards, smooth progress.
+6. **Dual pane** (F3 / ⋯ menu): two independent browsers side by side,
+   drag between them, F5 copy / F6 move to the other pane.
+7. **Git UI** (`gitInfo`, `gitLog`): branch chip in the address bar
+   (branch, ↑ahead ↓behind, changed count) → popover with remote + "Open
+   on GitHub" (`webUrl`) and recent commits; status badges on entries
+   (list/icon/column) + optional "Git" column in list view; refresh with
+   the listing.
+8. **Server as a computer**: Home cards show uptime/load/memory/disk
+   (`serverInfo`, refresh every 60 s only while Home is visible); "Open in
+   Terminal" for folders (local and remote) and servers.
+
+## lead (round 3)
+* `crates/git` + `git_info` / `git_log` (local git process or remote exec,
+  porcelain v2), `open_terminal`, `server_info` command, contract + docs,
+  probe measurements before/after, review.

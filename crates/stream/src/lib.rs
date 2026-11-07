@@ -11,6 +11,8 @@
 //! Thumbnails: `/{token}/thumb/{size}/{source}/{path segments}`, size
 //! clamped to 32..=512; any query (the UI's `?v=mtime`) is ignored.
 
+mod exif;
+mod freedesktop;
 mod thumb;
 
 use std::net::Ipv4Addr;
@@ -27,21 +29,39 @@ use vpsfiles_vfs::{BackendResolver, EntryKind, Location, Result, SourceId, VfsEr
 /// Bytes per body chunk read from the backend.
 const CHUNK: usize = 256 * 1024;
 
+/// Runs a shell command on an SSH host; the app implements it with
+/// `SshManager::exec`. Used for video thumbnails by the server's ffmpeg.
+#[async_trait::async_trait]
+pub trait RemoteExec: Send + Sync + 'static {
+    /// Exit status and stdout.
+    async fn exec(&self, host: &str, command: &str) -> Result<(u32, Vec<u8>)>;
+}
+
 /// Thumbnails cost (and the cache may delete) nothing but what is here.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MediaOptions {
     /// Disk cache for thumbnails; `None` = render every time.
     pub thumb_cache: Option<PathBuf>,
-    /// `ffmpeg` for video thumbnails; `None` = images only.
+    /// The freedesktop.org thumbnail dir (`~/.cache/thumbnails`), read and
+    /// written for local files so other file managers' thumbnails count.
+    pub shared_thumbnails: Option<PathBuf>,
+    /// Local `ffmpeg` for video thumbnails; `None` = no local video frames.
     pub ffmpeg: Option<PathBuf>,
+    /// Remote video frames by the host's own ffmpeg (falls back to the
+    /// local one where the host has none).
+    pub remote_exec: Option<Arc<dyn RemoteExec>>,
 }
 
 impl Default for MediaOptions {
-    /// `<cache dir>/vps-files/thumbs` and `ffmpeg` from `PATH`.
+    /// `<cache dir>/vps-files/thumbs`, `~/.cache/thumbnails` on Linux and
+    /// BSDs, `ffmpeg` from `PATH`, no remote exec.
     fn default() -> Self {
+        let freedesktop = cfg!(all(unix, not(target_os = "macos")));
         Self {
             thumb_cache: dirs::cache_dir().map(|d| d.join("vps-files").join("thumbs")),
+            shared_thumbnails: dirs::cache_dir().filter(|_| freedesktop).map(|d| d.join("thumbnails")),
             ffmpeg: thumb::find_program("ffmpeg"),
+            remote_exec: None,
         }
     }
 }
@@ -91,7 +111,8 @@ impl MediaServer {
         if options.ffmpeg.is_none() {
             tracing::info!("ffmpeg not found: no video thumbnails");
         }
-        let thumbs = thumb::Thumbnailer::new(options.thumb_cache, options.ffmpeg);
+        let thumbs =
+            thumb::Thumbnailer::new(options.thumb_cache, options.shared_thumbnails, options.ffmpeg, options.remote_exec);
         let ctx = Arc::new(Ctx { token: token.clone(), port, resolver, thumbs });
         let app = axum::Router::new().fallback(serve).with_state(ctx);
         let task = tokio::spawn(async move {

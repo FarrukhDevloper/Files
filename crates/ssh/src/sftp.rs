@@ -1,35 +1,54 @@
-//! A connected host's filesystem over SFTP (protocol v3, OpenSSH flavour).
+//! A connected host's filesystem over SFTP (protocol v3, OpenSSH flavour),
+//! on the raw session so requests can be pipelined:
+//!
+//! * `list`: OPENDIR, then READDIRs in flight together, CLOSE unawaited,
+//!   symlink targets stat'ed in one parallel batch → 2 round trips (3 with
+//!   symlinks).
+//! * `stat`: LSTAT and STAT together → 1 round trip.
+//! * reads/writes: see `sftp_io`; read handles are reused for a few seconds.
 
-use std::io::SeekFrom;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::stream::{FuturesOrdered, StreamExt};
 use russh::client::Handle;
 use russh_sftp::client::error::Error as SftpError;
-use russh_sftp::client::SftpSession;
+use russh_sftp::client::RawSftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
-use tokio::io::AsyncSeekExt;
 use vpsfiles_vfs::{
     path, Backend, BoxRead, BoxWrite, Capabilities, DiskSpace, Entry, EntryKind, Result, SourceId, VfsError, WriteMode,
 };
 
-use crate::manager::{exec, ssh_error, Client};
+use crate::manager::{exec, ssh_error, Client, SshTuning};
+use crate::shell;
+use crate::sftp_io::{close_later, IdleHandles, Reader, Stamp, Tuning, Writer, MAX_IN_FLIGHT};
 
 const S_IFMT: u32 = 0o170000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 const S_IFLNK: u32 = 0o120000;
 
-/// Symlink targets stat'ed in parallel while listing.
-const LINK_STATS_IN_FLIGHT: usize = 16;
+/// READDIRs in flight: starts at 2 (≤ ~100 entries done in one round
+/// trip), grows for big directories.
+const READDIR_FIRST: usize = 2;
+const READDIR_MAX: usize = 32;
+/// A stat this recent may vouch for an idle read handle.
+const STAT_FRESH: Duration = Duration::from_secs(3);
+const MAX_RECENT_STATS: usize = 512;
 
 /// A connected host's filesystem. Implements [`vpsfiles_vfs::Backend`].
 pub struct SftpBackend {
     host: String,
-    sftp: SftpSession,
+    raw: Arc<RawSftpSession>,
     /// Same connection, for `exec` (fast `rm -rf`) and liveness checks.
     handle: Arc<Handle<Client>>,
+    tuning: Arc<Tuning>,
+    statvfs: bool,
+    idle: Arc<IdleHandles>,
+    /// path → what the last `stat` saw, for reusing idle handles.
+    recent: Mutex<HashMap<String, (Stamp, Instant)>>,
 }
 
 fn file_type(a: &FileAttributes) -> u32 {
@@ -74,10 +93,6 @@ fn status_code(e: &SftpError) -> Option<StatusCode> {
     }
 }
 
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
-}
-
 /// What was being attempted, to turn SFTP v3's catch-all `Failure` (it has
 /// no EEXIST/ENOTEMPTY/ENOTDIR codes) into the precise `VfsError`.
 #[derive(Clone, Copy)]
@@ -92,15 +107,43 @@ enum Op {
 }
 
 impl SftpBackend {
-    pub(crate) async fn open(alias: &str, handle: Arc<Handle<Client>>) -> Result<Self> {
+    pub(crate) async fn open(
+        alias: &str,
+        handle: Arc<Handle<Client>>,
+        keep_handles: Duration,
+        tuning: SshTuning,
+    ) -> Result<Self> {
         let channel = handle.channel_open_session().await.map_err(|e| ssh_error(alias, e))?;
         channel.request_subsystem(true, "sftp").await.map_err(|e| ssh_error(alias, e))?;
-        // 16 x 256 KiB reads in flight can take a while on a slow uplink.
+        // Many big reads in flight can take a while on a slow uplink.
         let cfg = russh_sftp::client::Config { request_timeout_secs: 60, ..Default::default() };
-        let sftp = SftpSession::new_with_config(channel.into_stream(), cfg)
-            .await
-            .map_err(|e| VfsError::NotConnected(format!("{alias}: SFTP unavailable: {e}")))?;
-        Ok(Self { host: alias.to_string(), sftp, handle })
+        let raw = Arc::new(RawSftpSession::new_with_config(channel.into_stream(), cfg));
+        let version =
+            raw.init().await.map_err(|e| VfsError::NotConnected(format!("{alias}: SFTP unavailable: {e}")))?;
+        let has = |name: &str, ver: &str| version.extensions.get(name).is_some_and(|v| v == ver);
+        let tuning = Arc::new(Tuning::new(tuning.requests_in_flight, tuning.max_chunk));
+        if has(russh_sftp::extensions::LIMITS, "1") {
+            // Not waited for: until it's back, requests use the safe size.
+            let (raw, tuning, alias) = (raw.clone(), tuning.clone(), alias.to_string());
+            tokio::spawn(async move {
+                match raw.limits().await {
+                    Ok(l) => {
+                        tracing::debug!(target: "vpsfiles_ssh::io", "{alias}: server limits {l:?}");
+                        tuning.set_limits(l.max_read_len, l.max_write_len);
+                    }
+                    Err(e) => tracing::debug!("{alias}: limits@openssh.com: {e}"),
+                }
+            });
+        }
+        Ok(Self {
+            host: alias.to_string(),
+            idle: IdleHandles::new(raw.clone(), keep_handles),
+            raw,
+            handle,
+            tuning,
+            statvfs: has(russh_sftp::extensions::STATVFS, "2"),
+            recent: Mutex::new(HashMap::new()),
+        })
     }
 
     fn err(&self, e: SftpError, path: &str) -> VfsError {
@@ -126,16 +169,18 @@ impl SftpBackend {
         }
     }
 
+    async fn lstat(&self, p: &str) -> std::result::Result<FileAttributes, SftpError> {
+        self.raw.lstat(p).await.map(|a| a.attrs)
+    }
+
     async fn explain(&self, e: SftpError, path: &str, op: Op) -> VfsError {
         if status_code(&e) != Some(StatusCode::Failure) {
             return self.err(e, path);
         }
         let p = path.to_string();
-        let lstat = self.sftp.symlink_metadata(path).await.ok();
-        let stat = match &lstat {
-            Some(l) if is_link(l) => self.sftp.metadata(path).await.ok(),
-            other => other.clone(),
-        };
+        let (lstat, stat) = futures::join!(self.raw.lstat(path), self.raw.stat(path));
+        let lstat = lstat.ok().map(|a| a.attrs);
+        let stat = stat.ok().map(|a| a.attrs);
         match op {
             Op::Mkdir | Op::CreateNew if lstat.is_some() => VfsError::AlreadyExists(p),
             Op::OpenWrite if stat.as_ref().is_some_and(is_dir) => VfsError::IsADirectory(p),
@@ -145,6 +190,23 @@ impl SftpBackend {
             Op::List if stat.as_ref().is_some_and(|a| !is_dir(a)) => VfsError::NotADirectory(p),
             _ => self.err(e, path),
         }
+    }
+
+    /// Remember what a stat saw, for `open_read` to trust an idle handle.
+    fn saw(&self, p: &str, a: &FileAttributes) {
+        let mut recent = self.recent.lock().unwrap();
+        if recent.len() >= MAX_RECENT_STATS {
+            recent.retain(|_, (_, at)| at.elapsed() < STAT_FRESH);
+            if recent.len() >= MAX_RECENT_STATS {
+                recent.clear();
+            }
+        }
+        recent.insert(p.to_string(), (Stamp::of(a), Instant::now()));
+    }
+
+    fn fresh_stamp(&self, p: &str) -> Option<Stamp> {
+        let recent = self.recent.lock().unwrap();
+        recent.get(p).filter(|(_, at)| at.elapsed() < STAT_FRESH).map(|(s, _)| *s)
     }
 
     /// Post-order walk over SFTP (the trait's default, which an override
@@ -180,64 +242,102 @@ impl Backend for SftpBackend {
     }
 
     async fn home(&self) -> Result<String> {
-        self.sftp.canonicalize(".").await.map_err(|e| self.err(e, "."))
+        let name = self.raw.realpath(".").await.map_err(|e| self.err(e, "."))?;
+        name.files.into_iter().next().map(|f| f.filename).ok_or_else(|| VfsError::Io(format!("{}: no home", self.host)))
     }
 
     async fn list(&self, dir: &str) -> Result<Vec<Entry>> {
-        // readdir returns attrs in batches (~100 per round trip); only
-        // symlinks need an extra stat to learn what they point at.
-        let rd = match self.sftp.read_dir(dir).await {
-            Ok(rd) => rd,
+        let handle = match self.raw.opendir(dir).await {
+            Ok(h) => h.handle,
             Err(e) => return Err(self.explain(e, dir, Op::List).await),
         };
-        let raw: Vec<(String, String, FileAttributes)> = rd
-            .map(|item| {
-                let name = item.file_name();
-                let p = if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
-                (name, p, item.metadata())
-            })
-            .collect();
+        // READDIRs on one handle are answered in order; asking for several
+        // at once costs nothing extra (extra ones just say EOF).
+        let mut files = Vec::new();
+        let mut pending = FuturesOrdered::new();
+        let mut window = READDIR_FIRST;
+        let read = |raw: Arc<RawSftpSession>, h: String| async move { raw.readdir(h).await };
+        let mut failed = None;
+        loop {
+            while pending.len() < window {
+                pending.push_back(read(self.raw.clone(), handle.clone()));
+            }
+            match pending.next().await {
+                Some(Ok(name)) => {
+                    files.extend(name.files);
+                    window = (window + 2).min(READDIR_MAX);
+                }
+                Some(Err(e)) if status_code(&e) == Some(StatusCode::Eof) => break,
+                Some(Err(e)) => {
+                    failed = Some(e);
+                    break;
+                }
+                None => break,
+            }
+        }
+        drop(pending);
+        close_later(&self.raw, handle);
+        if let Some(e) = failed {
+            return Err(self.explain(e, dir, Op::List).await);
+        }
+
+        // Only symlinks need another look, all at once.
+        let path_of = |name: &str| if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") };
         let links: Vec<(usize, String)> =
-            raw.iter().enumerate().filter(|(_, (_, _, a))| is_link(a)).map(|(i, (_, p, _))| (i, p.clone())).collect();
-        let sftp = &self.sftp;
-        let mut targets: Vec<Option<FileAttributes>> = vec![None; raw.len()];
+            files.iter().enumerate().filter(|(_, f)| is_link(&f.attrs)).map(|(i, f)| (i, path_of(&f.filename))).collect();
+        let mut targets: HashMap<usize, FileAttributes> = HashMap::new();
         let mut stats = futures::stream::iter(links)
-            .map(|(i, p)| async move { (i, sftp.metadata(p).await.ok()) })
-            .buffer_unordered(LINK_STATS_IN_FLIGHT);
+            .map(|(i, p)| {
+                let raw = self.raw.clone();
+                async move { (i, raw.stat(p).await.ok()) }
+            })
+            .buffer_unordered(MAX_IN_FLIGHT);
         while let Some((i, t)) = stats.next().await {
-            targets[i] = t;
+            if let Some(t) = t {
+                targets.insert(i, t.attrs);
+            }
         }
         drop(stats);
-        Ok(raw
+        Ok(files
             .into_iter()
             .enumerate()
-            .map(|(i, (name, p, attrs))| to_entry(name, p, &attrs, targets[i].take().as_ref()))
+            .filter(|(_, f)| f.filename != "." && f.filename != "..")
+            .map(|(i, f)| {
+                let p = path_of(&f.filename);
+                to_entry(f.filename, p, &f.attrs, targets.get(&i))
+            })
             .collect())
     }
 
     async fn stat(&self, p: &str) -> Result<Entry> {
-        let lattrs = self.sftp.symlink_metadata(p).await.map_err(|e| self.err(e, p))?;
-        let target = if is_link(&lattrs) { self.sftp.metadata(p).await.ok() } else { None };
+        // Both at once: a symlink needs the second answer, others ignore it.
+        let (lstat, stat) = futures::join!(self.raw.lstat(p), self.raw.stat(p));
+        let lattrs = lstat.map_err(|e| self.err(e, p))?.attrs;
+        let target = if is_link(&lattrs) { stat.ok().map(|a| a.attrs) } else { None };
+        let shown = if is_link(&lattrs) { target.as_ref() } else { Some(&lattrs) };
+        if let Some(a) = shown.filter(|a| file_type(a) == S_IFREG) {
+            self.saw(p, a);
+        }
         Ok(to_entry(path::file_name(p).to_string(), p.to_string(), &lattrs, target.as_ref()))
     }
 
     async fn mkdir(&self, p: &str) -> Result<()> {
-        match self.sftp.create_dir(p).await {
-            Ok(()) => Ok(()),
+        match self.raw.mkdir(p, FileAttributes::empty()).await {
+            Ok(_) => Ok(()),
             Err(e) => Err(self.explain(e, p, Op::Mkdir).await),
         }
     }
 
     async fn remove_file(&self, p: &str) -> Result<()> {
-        match self.sftp.remove_file(p).await {
-            Ok(()) => Ok(()),
+        match self.raw.remove(p).await {
+            Ok(_) => Ok(()),
             Err(e) => Err(self.explain(e, p, Op::RemoveFile).await),
         }
     }
 
     async fn remove_dir(&self, p: &str) -> Result<()> {
-        match self.sftp.remove_dir(p).await {
-            Ok(()) => Ok(()),
+        match self.raw.rmdir(p).await {
+            Ok(_) => Ok(()),
             Err(e) => Err(self.explain(e, p, Op::RemoveDir).await),
         }
     }
@@ -246,14 +346,14 @@ impl Backend for SftpBackend {
         // OpenSSH's plain rename already refuses to replace files, but it
         // replaces empty dirs and other servers differ: check first, like
         // LocalBackend.
-        if self.sftp.symlink_metadata(to).await.is_ok() {
+        if self.lstat(to).await.is_ok() {
             return Err(VfsError::AlreadyExists(to.to_string()));
         }
-        match self.sftp.rename(from, to).await {
-            Ok(()) => Ok(()),
+        match self.raw.rename(from, to).await {
+            Ok(_) => Ok(()),
             Err(e) if status_code(&e) == Some(StatusCode::NoSuchFile) => {
                 // Missing source, or missing target directory.
-                if self.sftp.symlink_metadata(from).await.is_err() {
+                if self.lstat(from).await.is_err() {
                     Err(VfsError::NotFound(from.to_string()))
                 } else {
                     Err(VfsError::NotFound(to.to_string()))
@@ -264,11 +364,16 @@ impl Backend for SftpBackend {
     }
 
     async fn open_read(&self, p: &str, offset: u64) -> Result<BoxRead> {
-        let mut f = self.sftp.open(p).await.map_err(|e| self.err(e, p))?;
-        if offset > 0 {
-            f.seek(SeekFrom::Start(offset)).await.map_err(|e| VfsError::from_io(e, p))?;
+        let idle = Some((self.idle.clone(), p.to_string()));
+        // An idle handle is trusted only if a stat just now still shows the
+        // file it was opened on (not replaced or changed since).
+        if let Some(stamp) = self.fresh_stamp(p)
+            && let Some(h) = self.idle.take(p, stamp)
+        {
+            return Ok(Box::pin(Reader::new(self.raw.clone(), &self.tuning, h, offset, Some(stamp), idle)));
         }
-        Ok(Box::pin(f))
+        let h = self.raw.open(p, OpenFlags::READ, FileAttributes::empty()).await.map_err(|e| self.err(e, p))?.handle;
+        Ok(Box::pin(Reader::new(self.raw.clone(), &self.tuning, h, offset, None, idle)))
     }
 
     async fn open_write(&self, p: &str, mode: WriteMode) -> Result<BoxWrite> {
@@ -277,32 +382,34 @@ impl Backend for SftpBackend {
             WriteMode::Truncate => (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE, Op::OpenWrite),
             WriteMode::Append => (OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND, Op::OpenWrite),
         };
-        let mut f = match self.sftp.open_with_flags(p, flags).await {
-            Ok(f) => f,
+        let h = match self.raw.open(p, flags, FileAttributes::empty()).await {
+            Ok(h) => h.handle,
             Err(e) => return Err(self.explain(e, p, op).await),
         };
-        if mode == WriteMode::Append {
+        let offset = if mode == WriteMode::Append {
             // Servers that ignore APPEND still write at our offset: start at
             // the current end either way.
-            let size = f.metadata().await.map_err(|e| self.err(e, p))?.size.unwrap_or(0);
-            f.seek(SeekFrom::Start(size)).await.map_err(|e| VfsError::from_io(e, p))?;
-        }
-        Ok(Box::pin(f))
+            match self.raw.fstat(h.clone()).await {
+                Ok(a) => a.attrs.size.unwrap_or(0),
+                Err(e) => {
+                    close_later(&self.raw, h);
+                    return Err(self.err(e, p));
+                }
+            }
+        } else {
+            0
+        };
+        Ok(Box::pin(Writer::new(self.raw.clone(), &self.tuning, h, offset)))
     }
 
     async fn disk_space(&self, p: &str) -> Result<Option<DiskSpace>> {
         // statvfs@openssh.com; servers without it just show no space info.
-        match self.sftp.fs_info(p).await {
-            Ok(Some(s)) => {
-                let unit = if s.fragment_size > 0 { s.fragment_size } else { s.block_size };
-                Ok(Some(DiskSpace {
-                    free: s.blocks_avail.saturating_mul(unit),
-                    total: s.blocks.saturating_mul(unit),
-                }))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(self.err(e, p)),
+        if !self.statvfs {
+            return Ok(None);
         }
+        let s = self.raw.statvfs(p).await.map_err(|e| self.err(e, p))?;
+        let unit = if s.fragment_size > 0 { s.fragment_size } else { s.block_size };
+        Ok(Some(DiskSpace { free: s.blocks_avail.saturating_mul(unit), total: s.blocks.saturating_mul(unit) }))
     }
 
     async fn remove_all(&self, p: &str) -> Result<()> {
@@ -310,13 +417,13 @@ impl Backend for SftpBackend {
             return Err(VfsError::PermissionDenied(format!("refusing to delete {p}")));
         }
         // Missing path -> NotFound, like LocalBackend.
-        self.sftp.symlink_metadata(p).await.map_err(|e| self.err(e, p))?;
+        self.lstat(p).await.map_err(|e| self.err(e, p))?;
 
         // One command instead of a round trip per file. Trust it only if
         // the path is really gone (an sftp-only account runs no shell).
-        if let Ok(out) = exec(&self.handle, &self.host, &format!("rm -rf -- {}", shell_quote(p))).await {
+        if let Ok(out) = exec(&self.handle, &self.host, &format!("rm -rf -- {}", shell::quote(p))).await {
             if out.exit_status == 0 {
-                match self.sftp.symlink_metadata(p).await {
+                match self.lstat(p).await {
                     Err(e) if status_code(&e) == Some(StatusCode::NoSuchFile) => return Ok(()),
                     _ => {}
                 }
@@ -337,13 +444,6 @@ impl Backend for SftpBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn quoting() {
-        assert_eq!(shell_quote("/a b"), "'/a b'");
-        assert_eq!(shell_quote("/it's"), r"'/it'\''s'");
-        assert_eq!(shell_quote("/$(x)`y`"), "'/$(x)`y`'");
-    }
 
     #[test]
     fn entries_follow_links() {

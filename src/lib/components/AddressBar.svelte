@@ -6,6 +6,9 @@
   import { tick } from "svelte";
   import ChevronRight from "@lucide/svelte/icons/chevron-right";
   import Ellipsis from "@lucide/svelte/icons/ellipsis";
+  import GitBranch from "@lucide/svelte/icons/git-branch";
+  import GitPopover from "./GitPopover.svelte";
+  import { branchLabel } from "$lib/util/git";
   import House from "@lucide/svelte/icons/house";
   import Laptop from "@lucide/svelte/icons/laptop-minimal";
   import HardDrive from "@lucide/svelte/icons/hard-drive";
@@ -134,6 +137,15 @@
     ui.openMenu(e, folded.map((c): MenuItem => ({ label: c.label, run: () => crumbClick(c) })));
   }
 
+  // ---- git chip ----
+
+  let gitOpen = $state(false);
+  // A different folder or tab closes the popover.
+  $effect(() => {
+    void b.location;
+    gitOpen = false;
+  });
+
   // ---- editing ----
 
   let editing = $state(false);
@@ -180,16 +192,19 @@
     const t = parse(raw.trim());
     if (!t.path.trim()) t.path = "~";
     busy = true;
+    const tab = b;
+    const token = tab.claimNav();
     try {
       if (t.source.kind === "ssh") {
         try {
           await hosts.connect(t.source.host);
         } catch (e) {
-          toasts.error(e, `Couldn't connect to “${t.source.host}”`);
+          if (tab.isCurrentNav(token)) toasts.error(e, `Couldn't connect to “${t.source.host}”`);
           return;
         }
+        if (!tab.isCurrentNav(token)) return;
       }
-      if (await goToPath(b, t.source, t.path)) stopEdit(true);
+      if (await goToPath(tab, t.source, t.path, token)) stopEdit(true);
     } finally {
       busy = false;
     }
@@ -350,7 +365,7 @@
 
   function onBarDown(e: MouseEvent) {
     // Empty space (not a crumb) switches to the text field.
-    if (e.button !== 0 || editing || (e.target as HTMLElement).closest("button")) return;
+    if (e.button !== 0 || editing || (e.target as HTMLElement).closest("button, [role=dialog]")) return;
     e.preventDefault();
     void startEdit();
   }
@@ -449,6 +464,24 @@
         {/if}
       {/each}
     </nav>
+    {#if b.git}
+      {@const g = b.git}
+      <button
+        class="git-chip"
+        class:on={gitOpen}
+        title="Git: {branchLabel(g)}{g.changed ? `, ${g.changed} changed` : ''}"
+        aria-haspopup="dialog"
+        aria-expanded={gitOpen}
+        onclick={() => (gitOpen = !gitOpen)}
+      >
+        <GitBranch size={13} strokeWidth={2.2} />
+        <span class="branch">{branchLabel(g)}</span>
+        {#if g.ahead}<span class="ab" title="{g.ahead} to push">↑{g.ahead}</span>{/if}
+        {#if g.behind}<span class="ab" title="{g.behind} to pull">↓{g.behind}</span>{/if}
+        {#if g.changed}<span class="changed" title="{g.changed} changed">{g.changed}</span>{/if}
+      </button>
+      {#if gitOpen}<GitPopover {b} git={g} onclose={() => (gitOpen = false)} />{/if}
+    {/if}
     <!-- Natural widths for the folding layout; never visible. -->
     <div class="measure" aria-hidden="true">
       <div class="measure-row" bind:this={measurer}>
@@ -510,6 +543,37 @@
   /* Only the current folder may shrink (ellipsized) when even it won't fit. */
   .crumb.last { flex: 0 1 auto; min-width: 0; color: var(--fg-primary); font-weight: 600; }
   .crumb.icon-only, .crumb.more { padding: 0 6px; }
+  .git-chip {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 24px;
+    max-width: 40%;
+    margin-left: 4px;
+    padding: 0 9px;
+    border-radius: 12px;
+    background: var(--bg-window);
+    box-shadow: 0 0 0 0.5px var(--border-strong);
+    color: var(--fg-secondary);
+    font-size: var(--fs-small);
+    font-weight: 600;
+    cursor: default;
+  }
+  .git-chip:hover, .git-chip.on { color: var(--fg-primary); }
+  .git-chip .branch { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .git-chip .ab { font-variant-numeric: tabular-nums; }
+  .git-chip .changed {
+    min-width: 17px;
+    height: 17px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: var(--git-modified);
+    color: #fff;
+    font-size: 10.5px;
+    line-height: 17px;
+    text-align: center;
+  }
   .measure { position: absolute; left: 0; top: 0; width: 0; height: 0; overflow: hidden; visibility: hidden; pointer-events: none; }
   .measure-row { display: flex; width: max-content; }
   .crumb.drop { background: var(--accent); color: var(--accent-fg); }
@@ -558,7 +622,10 @@
     background: var(--bg-popover);
     box-shadow: var(--shadow-popover);
     cursor: default;
+    transform-origin: top center;
+    animation: drop-in var(--dur-fast) var(--ease-out);
   }
+  @keyframes drop-in { from { opacity: 0; transform: translateY(-4px) scale(0.98); } }
   li {
     display: flex;
     align-items: center;

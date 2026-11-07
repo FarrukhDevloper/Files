@@ -1,16 +1,20 @@
 // Lazy thumbnails for every view. With the media server (Tauri) images and
 // videos come pre-scaled from `/thumb/{size}/…` (src/lib/ipc/media.ts); in
 // a plain browser only small web images load, at full size, through
-// api.mediaUrl. One shared IntersectionObserver; at most MAX_LOADS loading at
-// once; a thumbnail that scrolls away before it finished gives its slot back
-// and drops its src.
+// api.mediaUrl. One shared IntersectionObserver; at most LOCAL_LOADS /
+// REMOTE_LOADS loading at once (separate, so a slow server never holds up
+// local files); a thumbnail that scrolls away before it finished gives its
+// slot back and drops its src (which aborts the request).
 
 import { api } from "$lib/ipc/api";
 import { initMedia, thumbUrl } from "$lib/ipc/media";
 import type { Entry, Location } from "$lib/ipc/types";
 import { extension } from "$lib/util/filetype";
 
-const MAX_LOADS = 4;
+const LOCAL_LOADS = 8;
+const REMOTE_LOADS = 6;
+/** Row icons (list/column view) never ask for more than this × DPR. */
+const ROW_MAX = 32;
 const MB = 1024 * 1024;
 /** Decoded by the backend (crates/stream). Its size limits; larger → 404. */
 const SERVER_IMAGES = new Set(["jpg", "jpeg", "png", "webp", "gif", "bmp"]);
@@ -58,8 +62,10 @@ export function isVideoThumb(entry: Entry): boolean {
 function source(entry: Entry, loc: Location, size: number): string | Promise<string> | null {
   const m = mode(entry, loc);
   if (m === "server") {
-    const want = Math.ceil(size * (globalThis.devicePixelRatio || 1));
-    const px = BUCKETS.find((b) => b >= want) ?? 512;
+    const dpr = globalThis.devicePixelRatio || 1;
+    const want = Math.ceil(size * dpr);
+    let px = BUCKETS.find((b) => b >= want) ?? 512;
+    if (size <= ROW_MAX) px = Math.min(px, Math.max(32, Math.floor(ROW_MAX * dpr)));
     return thumbUrl(loc, px, entry.modified);
   }
   return m === "direct" ? api.mediaUrl(loc) : null;
@@ -71,33 +77,39 @@ export function hasFailed(key: string): boolean {
   return failed.has(key);
 }
 
-// ---- concurrency gate ----
+// ---- concurrency gates: one for local files, one for servers ----
 
 type Job = { run: () => void };
-const queue: Job[] = [];
-let loading = 0;
 
-function enqueue(job: Job) {
-  queue.push(job);
-  pump();
-}
+class Gate {
+  #queue: Job[] = [];
+  #loading = 0;
+  constructor(readonly max: number) {}
 
-function dequeue(job: Job) {
-  const i = queue.indexOf(job);
-  if (i >= 0) queue.splice(i, 1);
-}
+  enqueue(job: Job) {
+    this.#queue.push(job);
+    this.#pump();
+  }
 
-function release() {
-  loading = Math.max(0, loading - 1);
-  pump();
-}
+  dequeue(job: Job) {
+    const i = this.#queue.indexOf(job);
+    if (i >= 0) this.#queue.splice(i, 1);
+  }
 
-function pump() {
-  while (loading < MAX_LOADS && queue.length) {
-    loading++;
-    queue.shift()!.run();
+  release() {
+    this.#loading = Math.max(0, this.#loading - 1);
+    this.#pump();
+  }
+
+  #pump() {
+    while (this.#loading < this.max && this.#queue.length) {
+      this.#loading++;
+      this.#queue.shift()!.run();
+    }
   }
 }
+
+const gates = { local: new Gate(LOCAL_LOADS), remote: new Gate(REMOTE_LOADS) };
 
 // ---- visibility ----
 
@@ -132,12 +144,13 @@ export function watchThumbnail(
   el: Element, entry: Entry, loc: Location, size: number, key: string, show: (url: string | null) => void,
 ): ThumbHandle {
   let state: "idle" | "queued" | "loading" | "done" = "idle";
+  const gate = loc.source.kind === "local" ? gates.local : gates.remote;
 
   const fail = () => {
     failed.add(key);
     if (state === "loading") {
       state = "done";
-      release();
+      gate.release();
     }
   };
 
@@ -154,14 +167,14 @@ export function watchThumbnail(
   observe(el, (visible) => {
     if (visible && state === "idle") {
       state = "queued";
-      enqueue(job);
+      gate.enqueue(job);
     } else if (!visible && state === "queued") {
-      dequeue(job);
+      gate.dequeue(job);
       state = "idle";
     } else if (!visible && state === "loading") {
       show(null);
       state = "idle";
-      release();
+      gate.release();
     }
   });
 
@@ -170,13 +183,13 @@ export function watchThumbnail(
       if (!ok) failed.add(key);
       if (state === "loading") {
         state = "done";
-        release();
+        gate.release();
       }
     },
     dispose() {
       unobserve(el);
-      if (state === "queued") dequeue(job);
-      if (state === "loading") release();
+      if (state === "queued") gate.dequeue(job);
+      if (state === "loading") gate.release();
       state = "done";
     },
   };

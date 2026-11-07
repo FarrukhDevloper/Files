@@ -44,7 +44,7 @@ export interface Place {
 export type ErrorCode =
   | "not_found" | "permission_denied" | "already_exists" | "not_a_directory"
   | "is_a_directory" | "not_empty" | "invalid_name" | "not_connected" | "auth"
-  | "host_key" | "unsupported" | "cancelled" | "io" | "other";
+  | "host_key" | "sign_in_needed" | "unsupported" | "cancelled" | "io" | "other";
 
 /** What every rejected command throws. */
 export interface VfsError {
@@ -149,6 +149,55 @@ export interface EditSession {
   error: VfsError | null;
   /** Unix ms of the last successful upload. */
   lastSync: number | null;
+}
+
+export type GitFileStatus =
+  | "modified" | "added" | "deleted" | "renamed" | "untracked" | "conflicted";
+
+/** Git state of the repository that contains a folder. */
+export interface GitInfo {
+  /** Repository root, same source as the queried folder. */
+  root: string;
+  /** null = detached HEAD. */
+  branch: string | null;
+  /** Short hash of HEAD; null in a repo without commits. */
+  head: string | null;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  /** URL of the "origin" remote as configured. */
+  remoteUrl: string | null;
+  /** https page for GitHub/GitLab/Bitbucket/Gitea-style remotes. */
+  webUrl: string | null;
+  /** Changed (incl. untracked) files in the whole repository. */
+  changed: number;
+  /** Status of entries directly inside the queried folder, by name.
+   * A folder gets the "strongest" status of anything below it. */
+  entries: Record<string, GitFileStatus>;
+}
+
+export interface GitCommit {
+  hash: string;
+  shortHash: string;
+  author: string;
+  email: string;
+  /** Unix ms. */
+  date: number;
+  subject: string;
+  /** Branch/tag names pointing at this commit. */
+  refs: string[];
+}
+
+/** Read-only snapshot of a server's health. Missing values = unknown. */
+export interface ServerInfo {
+  os: string | null;
+  kernel: string | null;
+  uptimeSecs: number | null;
+  /** 1, 5, 15 minute load averages. */
+  load: [number, number, number] | null;
+  cpus: number | null;
+  memTotal: number | null;
+  memAvailable: number | null;
 }
 
 /** Emitted on "prompt:request"; answer with api.promptRespond. */

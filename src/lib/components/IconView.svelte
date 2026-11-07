@@ -4,12 +4,14 @@
   import Thumb from "./Thumb.svelte";
   import { wantsThumbnail } from "$lib/thumbs.svelte";
   import RenameField from "./RenameField.svelte";
+  import GitBadge from "./GitBadge.svelte";
   import { itemPointer } from "./itemPointer";
   import { scrollMemory } from "./scrollMemory";
   import { backgroundMenu, commitRename, entryMenu } from "$lib/actions";
   import type { Browser } from "$lib/stores/browser.svelte";
   import { clipboard } from "$lib/stores/clipboard.svelte";
   import { dnd } from "$lib/stores/dnd.svelte";
+  import { tabs } from "$lib/stores/tabs.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { iconFor } from "$lib/util/filetype";
   import { sourceKey } from "$lib/util/path";
@@ -78,7 +80,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="viewport"
-  class:inactive={!ui.windowFocused}
+  class:inactive={!ui.windowFocused || tabs.current !== b}
   bind:this={viewport}
   bind:clientHeight={height}
   bind:clientWidth={width}
@@ -95,11 +97,13 @@
       <div
         class="cell"
         class:sel
-        class:cut={clipboard.cutKeys.has(cutPrefix + entry.path) || entry.isHidden}
+        class:cut={clipboard.cutKeys.has(cutPrefix + entry.path) || entry.isHidden || b.pending.has(entry.path)}
         style:left="{PAD + (i % cols) * cellW}px"
         style:top="{PAD + Math.floor(i / cols) * CELL_H}px"
         style:width="{cellW}px"
         class:drop={dnd.target?.key === cutPrefix + entry.path}
+        class:fresh={b.fresh.has(entry.path)}
+        class:leaving={b.leaving.has(entry.path)}
         data-drop={entry.kind === "dir" ? "dir" : undefined}
         data-drop-source={entry.kind === "dir" ? srcKey : undefined}
         data-drop-path={entry.kind === "dir" ? entry.path : undefined}
@@ -118,6 +122,7 @@
           {:else}
             <FileIcon type={iconFor(entry)} size={72} link={entry.isSymlink} />
           {/if}
+          {#if b.git?.entries[entry.name]}<span class="git-pos"><GitBadge status={b.git.entries[entry.name]!} round /></span>{/if}
         </div>
         {#if b.renaming === entry.path}
           <div class="rename"><RenameField {entry} center oncommit={(name) => commitRename(b, entry, name)} oncancel={() => (b.renaming = null)} /></div>
@@ -146,7 +151,8 @@
     padding-top: 4px;
   }
   .cell:focus-visible { box-shadow: none; }
-  .icon { padding: 3px; border-radius: 7px; }
+  .icon { position: relative; padding: 3px; border-radius: 7px; }
+  .git-pos { position: absolute; right: -2px; top: 0; }
   .sel .icon { background: var(--bg-pressed); }
   .drop .icon { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
   .label {
@@ -167,5 +173,8 @@
   .sel .label { background: var(--bg-sel); color: var(--fg-sel); }
   .inactive .sel .label { background: var(--bg-sel-inactive); color: var(--fg-sel-inactive); }
   .cut { opacity: 0.55; }
+  .cell.fresh { animation: cell-in var(--dur) var(--ease-out); }
+  .cell.leaving { opacity: 0; transform: scale(0.9); transition: opacity 0.14s var(--ease-out), transform 0.14s var(--ease-out); }
+  @keyframes cell-in { from { opacity: 0; transform: scale(0.9); } }
   .rename { width: calc(100% - 8px); margin-top: 3px; }
 </style>

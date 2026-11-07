@@ -57,7 +57,7 @@ impl IdentityFile {
     }
 
     /// Decrypt if needed. `None` = skip this key (unreadable or cancelled).
-    async fn load(&self, alias: &str, prompter: &dyn Prompter, saved: &mut Saved<'_>) -> Option<PrivateKey> {
+    async fn load(&self, cx: &AuthContext<'_>, saved: &mut Saved<'_>) -> Option<PrivateKey> {
         match russh::keys::decode_secret_key(&self.text, None) {
             Ok(k) => return Some(k),
             Err(russh::keys::Error::KeyIsEncrypted) => {}
@@ -70,11 +70,13 @@ impl IdentityFile {
         if let Some(pass) = saved.get().await.passphrases.get(&shown).cloned() {
             match russh::keys::decode_secret_key(&self.text, Some(&pass)) {
                 Ok(k) => return Some(k),
-                Err(_) => saved.update(|s| drop(s.passphrases.remove(&shown))).await,
+                // A quiet attempt leaves it for the user's next try.
+                Err(_) if cx.interactive => saved.update(|s| drop(s.passphrases.remove(&shown))).await,
+                Err(_) => {}
             }
         }
         for _ in 0..SECRET_ATTEMPTS {
-            let pass = prompter.passphrase(alias, &shown).await?;
+            let pass = cx.prompter.passphrase(cx.label, &shown).await?;
             match russh::keys::decode_secret_key(&self.text, Some(&pass.value)) {
                 Ok(k) => {
                     if pass.remember {
@@ -133,6 +135,11 @@ impl RsaHash {
 
 pub(crate) struct AuthContext<'a> {
     pub host: &'a HostConfig,
+    /// What prompts call the host: the alias, or "tanla via bastion" for a
+    /// jump host.
+    pub label: &'a str,
+    /// `false`: a background attempt; a saved secret that fails is kept.
+    pub interactive: bool,
     pub user: &'a str,
     pub agent: Option<&'a Path>,
     pub default_identities: &'a [PathBuf],
@@ -194,7 +201,7 @@ pub(crate) async fn authenticate(handle: &mut Handle<Client>, cx: AuthContext<'_
         if tried.iter().any(|k| file.has(k)) {
             continue;
         }
-        let Some(key) = file.load(alias, cx.prompter, &mut saved).await else { continue };
+        let Some(key) = file.load(&cx, &mut saved).await else { continue };
         let hash = rsa.for_key(handle, key.public_key()).await;
         let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
         match handle.authenticate_publickey(user, key).await.map_err(err)? {
@@ -212,8 +219,10 @@ pub(crate) async fn authenticate(handle: &mut Handle<Client>, cx: AuthContext<'_
             AuthResult::Success => return Ok(()),
             AuthResult::Failure { remaining_methods, .. } => {
                 methods = remaining_methods;
-                tracing::info!("{alias}: saved password was rejected; forgetting it");
-                saved.update(|s| s.password = None).await;
+                if cx.interactive {
+                    tracing::info!("{alias}: saved password was rejected; forgetting it");
+                    saved.update(|s| s.password = None).await;
+                }
             }
         }
     }
@@ -221,7 +230,7 @@ pub(crate) async fn authenticate(handle: &mut Handle<Client>, cx: AuthContext<'_
         if !takes_password(&methods) {
             break;
         }
-        let Some(password) = cx.prompter.password(alias, user).await else {
+        let Some(password) = cx.prompter.password(cx.label, user).await else {
             return Err(VfsError::Cancelled);
         };
         match password_auth(handle, user, &methods, &password.value).await.map_err(err)? {

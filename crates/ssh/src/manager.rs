@@ -24,7 +24,8 @@ use crate::hosts::{self, AppHost, HostDraft};
 use crate::known_hosts::{self, Check};
 use crate::secrets::{self, OsKeychain, SecretStore, Secrets};
 use crate::sftp::SftpBackend;
-use crate::{config, HostConfig, Prompter};
+use crate::info::{self, ServerInfo};
+use crate::{config, shell, HostConfig, Prompter};
 
 /// Hops in one ProxyJump route (also stops `ProxyJump` loops).
 const MAX_HOPS: usize = 8;
@@ -52,6 +53,37 @@ pub struct ExecOutput {
     pub stderr: Vec<u8>,
 }
 
+/// Transport and SFTP sizes. The defaults suit long, fast links; the knobs
+/// exist for measuring (see `examples/probe.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshTuning {
+    /// SSH channel window granted to the server: bytes it may send ahead.
+    pub channel_window: u32,
+    /// Largest SSH data packet we accept.
+    pub max_packet: u32,
+    /// Small requests leave at once instead of waiting for ACKs (Nagle).
+    pub tcp_nodelay: bool,
+    /// SFTP READs / WRITEs in flight per open file (reached by slow start).
+    pub requests_in_flight: usize,
+    /// Largest READ / WRITE size (also capped by the server's limits).
+    pub max_chunk: u32,
+}
+
+impl Default for SshTuning {
+    fn default() -> Self {
+        Self {
+            channel_window: 16 << 20,
+            max_packet: 65535,
+            tcp_nodelay: true,
+            // 64 × 32 KiB like OpenSSH's sftp: full speed to OpenSSH 9.6
+            // over a 130 ms Wi-Fi link with a concurrent stat still ~1 RTT;
+            // bigger READs measured 3–6× slower there.
+            requests_in_flight: 64,
+            max_chunk: 32 << 10,
+        }
+    }
+}
+
 /// Where the manager finds the user's SSH files. `Default` is the real
 /// `~/.ssh`, the app's hosts.json and the OS keychain; tests point
 /// everything at temp dirs and an in-memory store.
@@ -71,6 +103,10 @@ pub struct SshOptions {
     pub keepalive: Duration,
     /// TCP connect + SSH handshake (prompts happen outside of it).
     pub connect_timeout: Duration,
+    /// How long a read handle stays open after use, for seeks / Range
+    /// requests / re-reads of the same file.
+    pub read_handle_idle: Duration,
+    pub tuning: SshTuning,
 }
 
 impl SshOptions {
@@ -96,6 +132,8 @@ impl Default for SshOptions {
             default_identities: ["id_ed25519", "id_ecdsa", "id_rsa"].iter().map(|n| ssh_dir.join(n)).collect(),
             keepalive: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(20),
+            read_handle_idle: Duration::from_secs(15),
+            tuning: SshTuning::default(),
         }
     }
 }
@@ -121,6 +159,7 @@ impl SshManager {
                 slots: Mutex::new(HashMap::new()),
                 next_gen: AtomicU64::new(1),
                 hosts_file: Mutex::new(()),
+                reconnects: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -265,12 +304,23 @@ impl SshManager {
     }
 
     /// Connect if needed and return the host's SFTP backend. Concurrent
-    /// callers for the same alias share one connection attempt.
+    /// callers for the same alias share one connection attempt. May ask
+    /// the user (host key, password, passphrase).
     pub async fn backend(&self, alias: &str) -> Result<Arc<dyn Backend>> {
-        Ok(self.connection(alias).await?.sftp.clone())
+        Ok(self.inner.connection(alias, true).await?.sftp.clone())
     }
 
+    /// Connect if needed. `interactive: false` never asks the user, for the
+    /// host or any jump host: whatever would need a prompt ends the attempt
+    /// with [`VfsError::SignInNeeded`] (agent, key files and keychain
+    /// secrets still work). Startup auto-connect uses that.
+    pub async fn connect(&self, alias: &str, interactive: bool) -> Result<()> {
+        self.inner.connection(alias, interactive).await.map(drop)
+    }
+
+    /// Close the connection and stop reconnecting it in the background.
     pub async fn disconnect(&self, alias: &str) {
+        self.inner.reconnects.lock().unwrap().remove(alias);
         let prev = {
             let mut slots = self.inner.slots.lock().unwrap();
             let prev = slots.remove(alias);
@@ -288,40 +338,69 @@ impl SshManager {
 
     /// Run a shell command on the host (used for direct VPS→VPS copies).
     pub async fn exec(&self, alias: &str, command: &str) -> Result<ExecOutput> {
-        let conn = self.connection(alias).await?;
+        let conn = self.inner.connection(alias, true).await?;
         exec(&conn.handle, alias, command).await
     }
 
-    async fn connection(&self, alias: &str) -> Result<Arc<Connection>> {
-        let attempt = {
-            let mut slots = self.inner.slots.lock().unwrap();
-            match slots.get(alias) {
-                Some(Slot::Connected(c)) if !c.handle.is_closed() => return Ok(c.clone()),
-                Some(Slot::Connecting { attempt, .. }) => attempt.clone(),
-                _ => {
-                    let generation = self.inner.next_gen.fetch_add(1, Ordering::Relaxed);
-                    // Spawned so a caller that goes away can't abort a
-                    // half-done handshake that others are waiting on.
-                    let task = tokio::spawn(self.inner.clone().establish(alias.to_string(), generation));
-                    let attempt = async move {
-                        task.await.unwrap_or_else(|e| Err(VfsError::Other(format!("connect task failed: {e}"))))
-                    }
-                    .boxed()
-                    .shared();
-                    slots.insert(alias.to_string(), Slot::Connecting { generation, attempt: attempt.clone() });
-                    self.inner.emit(alias, ConnStatus::Connecting);
-                    attempt
-                }
-            }
-        };
-        attempt.await
+    /// OS, kernel, uptime, load, CPUs and memory from one read-only command
+    /// (connects quietly if needed). Fields the server can't tell are `None`;
+    /// an account without a shell is `unsupported`.
+    pub async fn server_info(&self, alias: &str) -> Result<ServerInfo> {
+        let conn = self.inner.connection(alias, false).await?;
+        let out = exec(&conn.handle, alias, &shell::sh_command(info::SCRIPT)).await?;
+        Ok(info::parse(&String::from_utf8_lossy(&out.stdout)))
     }
 }
 
 type Attempt = Shared<BoxFuture<'static, Result<Arc<Connection>>>>;
 
+/// Waits between background reconnect attempts; the last one repeats.
+const RECONNECT_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// Failures a background reconnect keeps retrying; the rest need the user.
+fn retry_later(e: &VfsError) -> bool {
+    matches!(e, VfsError::NotConnected(_) | VfsError::Io(_) | VfsError::Other(_))
+}
+
+/// The prompter of a background attempt: answers nothing, remembers why
+/// it would have asked.
+#[derive(Default)]
+struct Quiet {
+    needed: Mutex<Option<String>>,
+}
+
+impl Quiet {
+    fn need(&self, why: String) {
+        self.needed.lock().unwrap().get_or_insert(why);
+    }
+}
+
+#[async_trait::async_trait]
+impl Prompter for Quiet {
+    async fn confirm_host_key(&self, host: &str, _algorithm: &str, _fingerprint: &str) -> bool {
+        self.need(format!("unknown host key ({host})"));
+        false
+    }
+
+    async fn password(&self, host: &str, user: &str) -> Option<crate::Secret> {
+        self.need(format!("password for {user}@{host}"));
+        None
+    }
+
+    async fn passphrase(&self, host: &str, key_path: &str) -> Option<crate::Secret> {
+        self.need(format!("passphrase for {key_path} ({host})"));
+        None
+    }
+}
+
 enum Slot {
-    Connecting { generation: u64, attempt: Attempt },
+    Connecting { generation: u64, attempt: Attempt, interactive: bool },
     Connected(Arc<Connection>),
     /// Last attempt failed; kept so `status()` can show why.
     Failed(VfsError),
@@ -348,6 +427,14 @@ async fn close_all(handles: &[Arc<Handle<Client>>]) {
     for h in handles.iter().rev() {
         let _ = h.disconnect(Disconnect::ByApplication, "", "en").await;
     }
+}
+
+/// Who asks the user about one hop, and under which name.
+struct Ask<'a> {
+    /// The alias, or "tanla via bastion" for a jump host of tanla.
+    label: String,
+    prompter: &'a dyn Prompter,
+    interactive: bool,
 }
 
 /// How a hop is reached: directly, or through an open jump connection.
@@ -392,6 +479,8 @@ struct Inner {
     next_gen: AtomicU64,
     /// Serializes hosts.json read-modify-write.
     hosts_file: Mutex<()>,
+    /// alias → token of its live background reconnect loop.
+    reconnects: Mutex<HashMap<String, u64>>,
 }
 
 impl Inner {
@@ -400,8 +489,44 @@ impl Inner {
         let _ = self.events.send(ConnEvent { host: alias.to_string(), status });
     }
 
-    async fn establish(self: Arc<Self>, alias: String, generation: u64) -> Result<Arc<Connection>> {
-        let result = self.connect(&alias, generation).await;
+    /// The live connection, or join / start an attempt.
+    async fn connection(self: &Arc<Self>, alias: &str, interactive: bool) -> Result<Arc<Connection>> {
+        loop {
+            let (attempt, attempt_interactive) = {
+                let mut slots = self.slots.lock().unwrap();
+                match slots.get(alias) {
+                    Some(Slot::Connected(c)) if !c.handle.is_closed() => return Ok(c.clone()),
+                    Some(Slot::Connecting { attempt, interactive: i, .. }) => (attempt.clone(), *i),
+                    _ => {
+                        let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+                        // Spawned so a caller that goes away can't abort a
+                        // half-done handshake that others are waiting on.
+                        let task = tokio::spawn(self.clone().establish(alias.to_string(), generation, interactive));
+                        let attempt = async move {
+                            task.await.unwrap_or_else(|e| Err(VfsError::Other(format!("connect task failed: {e}"))))
+                        }
+                        .boxed()
+                        .shared();
+                        slots.insert(
+                            alias.to_string(),
+                            Slot::Connecting { generation, attempt: attempt.clone(), interactive },
+                        );
+                        self.emit(alias, ConnStatus::Connecting);
+                        (attempt, interactive)
+                    }
+                }
+            };
+            let result = attempt.await;
+            // We joined a quiet attempt that needed the user: ask ourselves.
+            if interactive && !attempt_interactive && matches!(result, Err(VfsError::SignInNeeded(_))) {
+                continue;
+            }
+            return result;
+        }
+    }
+
+    async fn establish(self: Arc<Self>, alias: String, generation: u64, interactive: bool) -> Result<Arc<Connection>> {
+        let result = self.connect(&alias, generation, interactive).await;
         let orphan = {
             let mut slots = self.slots.lock().unwrap();
             let current = matches!(slots.get(&alias), Some(Slot::Connecting { generation: g, .. }) if *g == generation);
@@ -433,13 +558,46 @@ impl Inner {
     }
 
     /// The SSH session ended on its own (network drop, server restart,
-    /// keepalive timeout): the next call reconnects.
-    fn on_dropped(&self, alias: &str, generation: u64) {
+    /// keepalive timeout): reconnect in the background, quietly.
+    fn on_dropped(self: &Arc<Self>, alias: &str, generation: u64) {
         let mut slots = self.slots.lock().unwrap();
         if matches!(slots.get(alias), Some(Slot::Connected(c)) if c.generation == generation) {
             slots.remove(alias);
             self.emit(alias, ConnStatus::Disconnected);
+            drop(slots);
+            self.reconnect_later(alias);
         }
+    }
+
+    fn reconnect_later(self: &Arc<Self>, alias: &str) {
+        let token = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        self.reconnects.lock().unwrap().insert(alias.to_string(), token);
+        let (me, alias) = (Arc::downgrade(self), alias.to_string());
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        rt.spawn(async move {
+            for delay in RECONNECT_BACKOFF.iter().chain(std::iter::repeat(&RECONNECT_BACKOFF[4])) {
+                tokio::time::sleep(*delay).await;
+                let Some(inner) = me.upgrade() else { return };
+                let ours = || inner.reconnects.lock().unwrap().get(&alias) == Some(&token);
+                if !ours() {
+                    return; // disconnect() or a newer drop took over
+                }
+                let busy = matches!(inner.slots.lock().unwrap().get(&alias), Some(Slot::Connected(_) | Slot::Connecting { .. }));
+                let result = if busy { Ok(()) } else { inner.connection(&alias, false).await.map(drop) };
+                match result {
+                    Err(e) if retry_later(&e) && ours() => {
+                        tracing::debug!("{alias}: reconnect failed ({e}); trying again");
+                    }
+                    _ => {
+                        let mut r = inner.reconnects.lock().unwrap();
+                        if r.get(&alias) == Some(&token) {
+                            r.remove(&alias);
+                        }
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     /// `alias`'s settings: `~/.ssh/config` if it lists the alias, else the
@@ -499,16 +657,27 @@ impl Inner {
         Ok(())
     }
 
-    async fn connect(self: &Arc<Self>, alias: &str, generation: u64) -> Result<Arc<Connection>> {
+    async fn connect(self: &Arc<Self>, alias: &str, generation: u64, interactive: bool) -> Result<Arc<Connection>> {
         let host = self.resolve(alias)?;
         let mut route = Vec::new();
         self.route(&host, 0, &mut route)?;
+        let quiet = (!interactive).then(Quiet::default);
+        let prompter: &dyn Prompter = match &quiet {
+            Some(q) => q,
+            None => &*self.prompter,
+        };
         let mut jumps = Vec::new();
-        match self.connect_via(&host, &route, &mut jumps, generation).await {
+        match self.connect_via(&host, &route, &mut jumps, generation, prompter, interactive).await {
             Ok((handle, sftp)) => Ok(Arc::new(Connection { generation, handle, jumps, sftp: Arc::new(sftp) })),
             Err(e) => {
                 close_all(&jumps).await;
-                Err(e)
+                // Failed because it couldn't ask: say what the user must do.
+                match quiet.and_then(|q| q.needed.into_inner().unwrap()) {
+                    Some(why) if matches!(e, VfsError::Cancelled | VfsError::Auth(_)) => {
+                        Err(VfsError::SignInNeeded(why))
+                    }
+                    _ => Err(e),
+                }
             }
         }
     }
@@ -521,15 +690,19 @@ impl Inner {
         route: &[HostConfig],
         jumps: &mut Vec<Arc<Handle<Client>>>,
         generation: u64,
+        prompter: &dyn Prompter,
+        interactive: bool,
     ) -> Result<(Arc<Handle<Client>>, SftpBackend)> {
+        let ask = |label: String| Ask { label, prompter, interactive };
         for (i, hop) in route.iter().enumerate() {
             let via = i.checked_sub(1).map(|prev| Via { handle: &jumps[prev], name: &route[prev].alias });
-            let handle = self.open(hop, &host.alias, generation, via).await?;
+            let ask = ask(format!("{} via {}", host.alias, hop.alias));
+            let handle = self.open(hop, &host.alias, generation, via, &ask).await?;
             jumps.push(Arc::new(handle));
         }
         let via = route.last().map(|last| Via { handle: jumps.last().unwrap(), name: &last.alias });
-        let handle = Arc::new(self.open(host, &host.alias, generation, via).await?);
-        let sftp = SftpBackend::open(&host.alias, handle.clone()).await?;
+        let handle = Arc::new(self.open(host, &host.alias, generation, via, &ask(host.alias.clone())).await?);
+        let sftp = SftpBackend::open(&host.alias, handle.clone(), self.opts.read_handle_idle, self.opts.tuning).await?;
         Ok((handle, sftp))
     }
 
@@ -541,6 +714,7 @@ impl Inner {
         slot: &str,
         generation: u64,
         via: Option<Via<'_>>,
+        ask: &Ask<'_>,
     ) -> Result<Handle<Client>> {
         let user = host.user.clone().unwrap_or_else(config::local_user);
 
@@ -551,7 +725,7 @@ impl Inner {
             match self.handshake(host, slot, generation, via).await {
                 Ok(handle) => break handle,
                 Err(ClientError::UnknownHostKey(key)) if !trusted_now => {
-                    self.trust(host, &key).await?;
+                    self.trust(host, &key, ask).await?;
                     trusted_now = true;
                 }
                 Err(e) => return Err(e.into_vfs(&host.alias)),
@@ -562,10 +736,12 @@ impl Inner {
             &mut handle,
             AuthContext {
                 host,
+                label: &ask.label,
+                interactive: ask.interactive,
                 user: &user,
                 agent: self.opts.agent.as_deref(),
                 default_identities: &self.opts.default_identities,
-                prompter: &*self.prompter,
+                prompter: ask.prompter,
                 secrets: &self.secrets,
             },
         )
@@ -591,7 +767,10 @@ impl Inner {
         let config = Arc::new(client::Config {
             keepalive_interval: Some(self.opts.keepalive),
             keepalive_max: 3,
-            nodelay: true,
+            // Enough for 64 big SFTP reads in flight over a long RTT (the
+            // default 2 MiB caps a 200 ms link at ~10 MiB/s).
+            window_size: self.opts.tuning.channel_window,
+            maximum_packet_size: self.opts.tuning.max_packet,
             preferred,
             ..Default::default()
         });
@@ -605,10 +784,16 @@ impl Inner {
             generation,
         };
         let (hostname, port) = (host.hostname.clone(), host.port);
+        let nodelay = self.opts.tuning.tcp_nodelay;
         let fut = async move {
             match via {
                 None => {
                     let stream = tokio::net::TcpStream::connect((hostname, port)).await.map_err(russh::Error::from)?;
+                    // russh applies `Config::nodelay` only to sockets it
+                    // opens itself, not to ours.
+                    if nodelay && let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!("set_nodelay: {e}");
+                    }
                     client::connect_stream(config, stream, handler).await
                 }
                 Some(via) => {
@@ -634,10 +819,10 @@ impl Inner {
     }
 
     /// TOFU: ask, then remember. Declining is a cancel, not an error.
-    async fn trust(&self, host: &HostConfig, key: &PublicKey) -> Result<()> {
+    async fn trust(&self, host: &HostConfig, key: &PublicKey, ask: &Ask<'_>) -> Result<()> {
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         let algorithm = key.algorithm().to_string();
-        if !self.prompter.confirm_host_key(&host.alias, &algorithm, &fingerprint).await {
+        if !ask.prompter.confirm_host_key(&ask.label, &algorithm, &fingerprint).await {
             return Err(VfsError::Cancelled);
         }
         known_hosts::append(&self.opts.known_hosts, &host.hostname, host.port, key).map_err(|e| {

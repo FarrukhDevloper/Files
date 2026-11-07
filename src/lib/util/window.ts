@@ -55,3 +55,14 @@ export async function pickFile(opts: { title?: string; defaultPath?: string }): 
   const picked = await open({ ...opts, multiple: false, directory: false });
   return typeof picked === "string" ? picked : null;
 }
+
+/** Open an http(s) link in the default browser. */
+export async function openUrl(url: string): Promise<void> {
+  if (!/^https?:\/\//.test(url)) return;
+  if (!isTauri) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  const { openUrl: open } = await import("@tauri-apps/plugin-opener");
+  await open(url);
+}

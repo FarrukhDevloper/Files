@@ -2,7 +2,10 @@
   import X from "@lucide/svelte/icons/x";
   import Plus from "@lucide/svelte/icons/plus";
   import Server from "@lucide/svelte/icons/server";
+  import { flip } from "svelte/animate";
+  import { scale } from "svelte/transition";
   import { newTab } from "$lib/actions";
+  import { easeOut, ms } from "$lib/util/motion";
   import { dnd, dropKey } from "$lib/stores/dnd.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
   import { sourceKey } from "$lib/util/path";
@@ -21,6 +24,9 @@
     {@const remote = t.location?.source.kind === "ssh" ? t.location.source.host : null}
     <div
       class="tab"
+      in:scale={{ start: 0.9, duration: ms(160), easing: easeOut }}
+      out:scale={{ start: 0.9, duration: ms(120), easing: easeOut }}
+      animate:flip={{ duration: ms(160), easing: easeOut }}
       class:active={i === tabs.active}
       class:drop={!!t.location && dnd.target?.key === dropKey(t.location)}
       data-drop={t.location ? "dir" : undefined}

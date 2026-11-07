@@ -24,7 +24,8 @@
   import { toasts } from "$lib/stores/toasts.svelte";
   import { transfers } from "$lib/stores/transfers.svelte";
   import { ui } from "$lib/stores/ui.svelte";
-  import { parentPath, sameLocation } from "$lib/util/path";
+  import { listings } from "$lib/stores/listings";
+  import { parentPath, parseSourceKey, sameLocation } from "$lib/util/path";
   import { isTextInput } from "$lib/util/platform";
 
   dnd.onDrop = (target, items, copy) => void dropItems(target, items, copy);
@@ -34,6 +35,8 @@
     void initThumbs();
     Promise.all([prompts.init(), hosts.init(), transfers.init(), edits.init()])
       .then(() => {
+        // Like mounted disks: servers come up by themselves (no prompts).
+        if (prefs.autoConnect) hosts.connectAllQuietly();
         // ?open=…&view=…&select=… for screenshot runs (src/lib/devhooks.ts).
         if (import.meta.env.DEV) void import("$lib/devhooks").then((m) => m.runDevHooks());
       })
@@ -47,20 +50,20 @@
       }
       // Show the result: refresh every tab looking at the destination
       // (or, for a move, at a source folder).
-      for (const b of tabs.list) {
+      for (const b of tabs.all) {
         const touched = sameLocation(b.location, job.destDir)
           || (job.op === "move" && job.sources.some((s) => sameLocation(b.location, { source: s.source, path: parentPath(s.path) ?? "/" })));
-        if (touched) void b.refresh();
+        if (touched) b.revalidate();
       }
     });
 
+    // Like a mounted disk: a dropped server keeps its folders on screen
+    // (the backend reconnects); once it's back they are re-listed quietly.
     const offStatus = hosts.onStatus((host, status, prev) => {
-      if (prev?.state !== "connected" || status.state === "connected" || status.state === "connecting") return;
-      for (const b of tabs.list) {
+      if (status.state !== "connected" || prev?.state === "connected") return;
+      for (const b of tabs.all) {
         const loc = b.location;
-        if (loc?.source.kind === "ssh" && loc.source.host === host) {
-          b.invalidate(status.state === "failed" ? status.error : { code: "not_connected", message: `The connection to ${host} was closed.` });
-        }
+        if (loc?.source.kind === "ssh" && loc.source.host === host) b.revalidate();
       }
     });
 
@@ -78,6 +81,14 @@
     if (button && !button.closest("[role=dialog], [role=menu]")) e.preventDefault();
   }
 
+  /** Resting the pointer on any folder (row, sidebar, crumb, card) lists it
+   *  ahead of the click. */
+  function onmouseover(e: MouseEvent) {
+    const el = (e.target as HTMLElement).closest?.<HTMLElement>("[data-drop=dir]");
+    const path = el?.dataset.dropPath;
+    listings.prefetchSoon(el && path ? { source: parseSourceKey(el.dataset.dropSource ?? "local"), path } : null);
+  }
+
   function oncontextmenu(e: MouseEvent) {
     // No browser/webview menu; text fields and selectable text keep theirs.
     const t = e.target as HTMLElement;
@@ -88,6 +99,7 @@
 <svelte:window
   onkeydown={handleKeydown}
   {onmousedown}
+  {onmouseover}
   onmouseup={handleMouseNav}
   onfocus={() => (ui.windowFocused = true)}
   onblur={() => (ui.windowFocused = false)}

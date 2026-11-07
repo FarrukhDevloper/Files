@@ -77,7 +77,7 @@ class Edits {
       toasts.info(`Saved “${name}” to ${where}`);
       // Show the new size and date wherever the folder is open.
       const dir = { source: s.location.source, path: parentPath(s.location.path) ?? "/" };
-      for (const b of tabs.list) if (sameLocation(b.location, dir)) void b.refresh();
+      for (const b of tabs.all) if (sameLocation(b.location, dir)) b.revalidate();
     } else if (s.state === "failed") {
       toasts.error(s.error ?? { code: "other", message: "Sync failed" }, `Couldn't sync “${name}”`);
     } else if (s.state === "conflict") {

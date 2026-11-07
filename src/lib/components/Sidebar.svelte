@@ -24,6 +24,7 @@
 
   function hostTitle(h: HostInfo): string {
     const target = hostAddress(h);
+    if (hosts.needsUser.has(h.alias)) return `${target}\nClick to connect (sign-in needed)`;
     if (h.status.state === "failed") return `${target}\n${h.status.error.message}`;
     return `${target} — ${h.status.state}`;
   }
@@ -127,7 +128,7 @@
       >
         <span class="icon"><Server size={18} strokeWidth={1.8} /></span>
         <span class="label">{h.alias}</span>
-        <span class="dot {h.status.state}" role="img" aria-label={h.status.state}></span>
+        <span class="dot {hosts.dot(h)}" role="img" aria-label={hosts.dot(h)}></span>
       </button>
     {:else}
       <button class="empty" onclick={addServer}>No servers yet. Add one…</button>

@@ -7,7 +7,8 @@
   import Thumb from "./Thumb.svelte";
   import { wantsThumbnail } from "$lib/thumbs.svelte";
   import RenameField from "./RenameField.svelte";
-  import type { Entry, SourceId } from "$lib/ipc/types";
+  import GitBadge from "./GitBadge.svelte";
+  import type { Entry, GitFileStatus, SourceId } from "$lib/ipc/types";
   import { dnd } from "$lib/stores/dnd.svelte";
   import { iconFor } from "$lib/util/filetype";
 
@@ -20,6 +21,11 @@
     active: boolean;
     isSelected: (path: string) => boolean;
     isCut?: (path: string) => boolean;
+    /** Insert / remove animations (current column only). */
+    isFresh?: (path: string) => boolean;
+    isLeaving?: (path: string) => boolean;
+    /** Git status by entry name (current column). */
+    gitStatus?: (name: string) => GitFileStatus | undefined;
     renaming?: string | null;
     reveal?: string | null;
     revealSeq?: number;
@@ -33,7 +39,7 @@
   }
 
   let {
-    entries, srcKey, source = null, active, isSelected, isCut = () => false, renaming = null, reveal = null, revealSeq = 0,
+    entries, srcKey, source = null, active, isSelected, isCut = () => false, isFresh = () => false, isLeaving = () => false, gitStatus = () => undefined, renaming = null, reveal = null, revealSeq = 0,
     onrowdown, onrowclick, onrowdbl, onrowmenu, onbackground, onrename, oncancelrename,
   }: Props = $props();
 
@@ -81,6 +87,8 @@
         class:sel
         class:active={sel && active}
         class:cut={isCut(entry.path) || entry.isHidden}
+        class:fresh={isFresh(entry.path)}
+        class:leaving={isLeaving(entry.path)}
         class:drop={dnd.target?.key === `${srcKey}|${entry.path}`}
         style:top="{PAD + i * ROW}px"
         data-path={entry.path}
@@ -104,6 +112,8 @@
           <RenameField {entry} oncommit={(name) => onrename(entry, name)} oncancel={() => oncancelrename?.()} />
         {:else}
           <span class="name name-text">{entry.name}</span>
+          {@const st = gitStatus(entry.name)}
+          {#if st}<GitBadge status={st} />{/if}
         {/if}
         {#if dir}<span class="chev"><ChevronRight size={13} strokeWidth={2.2} /></span>{/if}
       </div>
@@ -135,7 +145,11 @@
   .row.active { background: var(--bg-sel); color: var(--fg-sel); }
   .row.drop { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
   .row.cut .name, .row.cut :global(.fi) { opacity: 0.55; }
+  .row.fresh { animation: row-in var(--dur) var(--ease-out); }
+  .row.leaving { opacity: 0; transform: translateX(-8px); transition: opacity 0.14s var(--ease-out), transform 0.14s var(--ease-out); }
+  @keyframes row-in { from { opacity: 0; transform: translateY(-6px); } }
   .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chev { display: grid; place-items: center; color: var(--fg-tertiary); }
   .row.sel .chev { color: inherit; }
+  .row.active :global(.git) { color: inherit; }
 </style>

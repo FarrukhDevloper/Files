@@ -5,17 +5,20 @@
   import Server from "@lucide/svelte/icons/server";
   import Plus from "@lucide/svelte/icons/plus";
   import Ellipsis from "@lucide/svelte/icons/ellipsis";
+  import Clock from "@lucide/svelte/icons/clock";
+  import Gauge from "@lucide/svelte/icons/gauge";
+  import MemoryStick from "@lucide/svelte/icons/memory-stick";
   import { placeIcons, placeLabel } from "./places";
   import { addServer, disconnectHost, hostAddress, hostMenu, openHost, openPlace } from "$lib/actions";
   import { api } from "$lib/ipc/api";
-  import type { DiskSpace, HostInfo, SourceId } from "$lib/ipc/types";
+  import type { DiskSpace, HostInfo, ServerInfo, SourceId } from "$lib/ipc/types";
   import { dnd } from "$lib/stores/dnd.svelte";
   import { hosts } from "$lib/stores/hosts.svelte";
-  import { tabs } from "$lib/stores/tabs.svelte";
+  import type { Browser } from "$lib/stores/browser.svelte";
   import { errorTitle } from "$lib/util/errors";
   import { formatSize } from "$lib/util/format";
 
-  const b = $derived(tabs.current);
+  let { b }: { b: Browser } = $props();
   const local: SourceId = { kind: "local" };
 
   // ---- disk usage: local drives once, servers while connected ----
@@ -53,7 +56,40 @@
     });
   });
 
+  // ---- server health: while Home is on screen, refreshed every minute ----
+
+  const STATS_EVERY = 60_000;
+  let stats = $state.raw(new Map<string, ServerInfo>());
+
+  function loadStats(aliases: string[]) {
+    for (const alias of aliases) {
+      api.serverInfo(alias).then(
+        (info) => { stats = new Map(stats).set(alias, info); },
+        () => {},
+      );
+    }
+  }
+
+  $effect(() => {
+    const up = hosts.list.filter((h) => h.status.state === "connected").map((h) => h.alias);
+    untrack(() => {
+      // Newly connected servers right away; gone ones drop their numbers.
+      const missing = up.filter((a) => !stats.has(a));
+      if (missing.length) loadStats(missing);
+      if ([...stats.keys()].some((a) => !up.includes(a))) stats = new Map([...stats].filter(([a]) => up.includes(a)));
+    });
+    const t = setInterval(() => loadStats(up), STATS_EVERY);
+    return () => clearInterval(t);
+  });
+
+  function uptime(secs: number): string {
+    if (secs < 3600) return `${Math.max(1, Math.round(secs / 60))} min`;
+    if (secs < 2 * 86_400) return `${Math.round(secs / 3600)} h`;
+    return `${Math.round(secs / 86_400)} d`;
+  }
+
   function statusText(h: HostInfo): string {
+    if (hosts.needsUser.has(h.alias) && h.status.state !== "connecting") return "Sign-in needed";
     switch (h.status.state) {
       case "connected": return "Connected";
       case "connecting": return "Connecting…";
@@ -67,7 +103,7 @@
   {#if d && d.total > 0}
     {@const used = 1 - d.free / d.total}
     <span class="usage">
-      <span class="bar" class:full={used > 0.9}><span style:width="{Math.round(used * 100)}%"></span></span>
+      <span class="bar" class:full={used > 0.9}><span style:transform="scaleX({used})"></span></span>
       <span class="usage-text">{formatSize(d.free)} free of {formatSize(d.total)}</span>
     </span>
   {/if}
@@ -123,7 +159,7 @@
     <h2>Servers</h2>
     <div class="cards">
       {#each hosts.list as h (h.alias)}
-        {@const state = h.status.state}
+        {@const state = hosts.dot(h)}
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="card server"
@@ -132,7 +168,7 @@
           data-drop-host={h.alias}
           oncontextmenu={(e) => hostMenu(b, e, h.alias)}
         >
-          <button class="server-main" title={h.status.state === "failed" ? h.status.error.message : `Open ${h.alias}`} onclick={() => void openHost(b, h.alias)}>
+          <button class="server-main" title={state === "failed" && h.status.state === "failed" ? h.status.error.message : `Open ${h.alias}`} onclick={() => void openHost(b, h.alias)}>
             <span class="big-icon">
               <Server size={26} strokeWidth={1.6} />
               <span class="dot {state}"></span>
@@ -143,6 +179,23 @@
               <span class="status" class:failed={state === "failed"}>{statusText(h)}</span>
             </span>
           </button>
+          {#if state === "connected" && stats.get(h.alias)}
+            {@const info = stats.get(h.alias)!}
+            <div class="stats">
+              {#if info.uptimeSecs !== null}<span title="Up for {uptime(info.uptimeSecs)}"><Clock size={13} /> {uptime(info.uptimeSecs)}</span>{/if}
+              {#if info.load}
+                <span class:hot={info.cpus !== null && info.load[0] > info.cpus} title="Load (1, 5, 15 min): {info.load.join(', ')}{info.cpus ? ` on ${info.cpus} CPUs` : ''}">
+                  <Gauge size={13} /> {info.load[0].toFixed(2)}
+                </span>
+              {/if}
+              {#if info.memTotal !== null && info.memAvailable !== null}
+                <span class:hot={info.memAvailable / info.memTotal < 0.1} title="Memory: {formatSize(info.memTotal - info.memAvailable)} used of {formatSize(info.memTotal)}">
+                  <MemoryStick size={13} /> {formatSize(info.memTotal - info.memAvailable)} / {formatSize(info.memTotal)}
+                </span>
+              {/if}
+            </div>
+            {#if info.os}<span class="os" title={info.kernel ?? undefined}>{info.os}{info.cpus ? ` · ${info.cpus} CPUs` : ""}</span>{/if}
+          {/if}
           {@render usageBar(usage.get(`ssh:${h.alias}`))}
           <div class="actions">
             {#if state === "connected"}
@@ -220,6 +273,21 @@
     text-align: left;
   }
   .card.drop, .place.drop { background: var(--accent-soft); box-shadow: inset 0 0 0 2px var(--accent); }
+  /* Hover lift: transform + a pre-rendered shadow that only fades in. */
+  .card, .place { position: relative; transition: transform var(--dur-fast) var(--ease-out); }
+  .card::after, .place::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.16);
+    opacity: 0;
+    transition: opacity var(--dur-fast) var(--ease-out);
+    pointer-events: none;
+  }
+  .card:hover, .place:hover { transform: translateY(-2px); }
+  .card:hover::after, .place:hover::after { opacity: 1; }
+  .card:active:not(:has(.actions:active)), .place:active { transform: translateY(0) scale(0.99); }
   .drive { flex-direction: row; align-items: center; gap: 12px; }
   .drive:hover { background: var(--bg-hover); }
 
@@ -256,6 +324,10 @@
   .status { color: var(--fg-secondary); font-size: var(--fs-small); }
   .status.failed { color: var(--danger); }
 
+  .stats { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--fg-secondary); font-size: var(--fs-small); font-variant-numeric: tabular-nums; }
+  .stats span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .stats .hot { color: var(--git-modified); }
+  .os { margin-top: -6px; color: var(--fg-tertiary); font-size: var(--fs-small); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .server-main { display: flex; align-items: center; gap: 12px; text-align: left; border-radius: 8px; }
   .actions { display: flex; align-items: center; gap: 8px; }
   .actions .btn { min-width: 0; }
@@ -263,7 +335,7 @@
 
   .usage { display: flex; flex-direction: column; gap: 4px; }
   .bar { height: 5px; border-radius: 3px; background: var(--progress-track); overflow: hidden; }
-  .bar span { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
+  .bar span { display: block; height: 100%; border-radius: 3px; background: var(--accent); transform-origin: left; transition: transform var(--dur-slow) var(--ease-out); }
   .bar.full span { background: var(--danger); }
   .usage-text { color: var(--fg-secondary); font-size: var(--fs-small); }
 

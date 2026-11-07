@@ -8,6 +8,7 @@
   import { api, isTauri } from "$lib/ipc/api";
   import type { HostDraft, HostInfo } from "$lib/ipc/types";
   import { hosts } from "$lib/stores/hosts.svelte";
+  import { listings } from "$lib/stores/listings";
   import { tabs } from "$lib/stores/tabs.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { errorTitle, toVfsError } from "$lib/util/errors";
@@ -77,8 +78,9 @@
       if (!initial) {
         void openHost(tabs.current, saved.alias);
       } else if (initial.alias !== saved.alias) {
+        listings.dropSource({ kind: "ssh", host: initial.alias });
         // Renamed: tabs on the old name have nothing to reconnect to.
-        for (const t of tabs.list) {
+        for (const t of tabs.all) {
           if (t.location?.source.kind === "ssh" && t.location.source.host === initial.alias) openStart(t);
         }
       }

@@ -48,7 +48,7 @@
     display: flex;
     justify-content: center;
     background: var(--bg-overlay);
-    animation: fade 0.12s ease-out;
+    animation: fade var(--dur-fast) var(--ease-out);
   }
   .sheet {
     align-self: flex-start;
@@ -59,8 +59,9 @@
     border-radius: 0 0 var(--r-popover) var(--r-popover);
     background: var(--bg-sheet);
     box-shadow: var(--shadow-sheet);
-    animation: drop 0.16s ease-out;
+    transform-origin: top center;
+    animation: drop var(--dur) var(--ease-out);
   }
-  @keyframes drop { from { transform: translateY(-12px); opacity: 0; } }
+  @keyframes drop { from { transform: translateY(-14px) scale(0.98); opacity: 0; } }
   @keyframes fade { from { opacity: 0; } }
 </style>

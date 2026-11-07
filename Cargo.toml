@@ -14,9 +14,10 @@ vpsfiles-ssh = { path = "crates/ssh" }
 vpsfiles-transfer = { path = "crates/transfer" }
 vpsfiles-stream = { path = "crates/stream" }
 vpsfiles-edit = { path = "crates/edit" }
+vpsfiles-git = { path = "crates/git" }
 
 # async + plumbing
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "process"] }
 async-trait = "0.1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +44,11 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 mime_guess = "2"
 # thumbnails (no avif/tiff: big decoders, rare on servers)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+# DCT-scaled JPEG decode (1/2, 1/4, 1/8) — image's zune-jpeg can't scale
+jpeg-decoder = { version = "0.3", default-features = false }
+# freedesktop thumbnail cache: md5(URI) file names, PNG tEXt Thumb::URI/MTime
+md5 = "0.8"
+png = "0.18"
 
 # local fs
 notify = "8"

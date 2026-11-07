@@ -10,14 +10,17 @@ vpsfiles-vfs.workspace = true
 # process: ffmpeg for video thumbnails
 tokio = { workspace = true, features = ["process"] }
 futures.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 axum.workspace = true
 mime_guess.workspace = true
 image.workspace = true
+jpeg-decoder.workspace = true
+md5.workspace = true
+png.workspace = true
 dirs.workspace = true
 sha1.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
 tempfile = "3"

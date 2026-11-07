@@ -367,6 +367,27 @@ async fn exec_collects_output_and_status() {
 }
 
 #[tokio::test]
+async fn server_info_from_one_command() {
+    // The test server runs commands locally: this machine's /proc.
+    let (server, _home, _p, mgr) = connected().await;
+    // Quiet: it doesn't sign in by itself...
+    assert_eq!(code(mgr.server_info("test").await), "sign_in_needed");
+    // ...but uses the connection the user opened.
+    mgr.backend("test").await.unwrap();
+    let info = mgr.server_info("test").await.unwrap();
+    assert_eq!(server.count(|c| &c.execs), 1);
+    assert!(info.kernel.is_some() && info.os.is_some(), "{info:?}");
+    if cfg!(target_os = "linux") {
+        assert!(info.cpus.unwrap() >= 1);
+        assert!(info.mem_total.unwrap() >= info.mem_available.unwrap());
+        assert!(info.load.is_some() && info.uptime_secs.is_some(), "{info:?}");
+    }
+    // No shell (sftp-only account): unsupported.
+    *server.state.allow_exec.lock().unwrap() = false;
+    assert_eq!(code(mgr.server_info("test").await), "unsupported");
+}
+
+#[tokio::test]
 async fn hosts_come_from_configured_file() {
     let home = Home::new();
     home.write("config", "Host a b\nHost *\n  User x\n");
@@ -374,6 +395,115 @@ async fn hosts_come_from_configured_file() {
     let hosts = mgr.hosts().unwrap();
     assert_eq!(hosts.iter().map(|h| h.alias.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     assert_eq!(hosts[0].user.as_deref(), Some("x"));
+}
+
+// ---- quiet connects and background reconnects ----------------------------
+
+fn sign_in_reason<T>(r: Result<T, VfsError>) -> String {
+    match r {
+        Err(VfsError::SignInNeeded(why)) => why,
+        Err(e) => panic!("expected sign_in_needed, got {e:?}"),
+        Ok(_) => panic!("expected sign_in_needed, got Ok"),
+    }
+}
+
+#[tokio::test]
+async fn quiet_connect_never_prompts() {
+    let server = TestServer::start(key(1)).await;
+    let home = Home::new();
+    home.config(server.port, "");
+    let p = Arc::new(TestPrompter { password: Some(PASSWORD.into()), remember: true, ..TestPrompter::trusting() });
+    let mgr = home.manager(p.clone());
+
+    // Unknown host key: not asked, not saved.
+    assert!(sign_in_reason(mgr.connect("test", false).await).contains("host key"));
+    assert!(matches!(mgr.status("test"), ConnStatus::Failed { error: VfsError::SignInNeeded(_) }));
+    assert_eq!((p.asked(), home.known_hosts()), ((0, 0, 0), String::new()));
+
+    // The user connects once (and saves the password)...
+    mgr.connect("test", true).await.unwrap();
+    assert_eq!(p.asked(), (1, 1, 0));
+    mgr.disconnect("test").await;
+    // ...after that quiet works: keychain, no questions.
+    mgr.connect("test", false).await.unwrap();
+    assert_eq!(p.asked(), (1, 1, 0));
+    mgr.disconnect("test").await;
+
+    // A saved password that fails is kept for the user to deal with.
+    home.secrets.put("test", json!({ "password": "stale" }));
+    assert!(sign_in_reason(mgr.connect("test", false).await).contains("password for tester@test"));
+    assert_eq!(home.secrets.item("test"), Some(json!({ "password": "stale" })));
+    assert_eq!(p.asked(), (1, 1, 0));
+
+    // An interactive caller that finds a quiet attempt asks for itself.
+    home.secrets.items.lock().unwrap().clear();
+    let (quiet, loud) = tokio::join!(mgr.connect("test", false), mgr.backend("test"));
+    loud.unwrap();
+    assert!(quiet.is_ok() || matches!(quiet, Err(VfsError::SignInNeeded(_))), "{quiet:?}");
+    assert_eq!(mgr.status("test"), ConnStatus::Connected);
+}
+
+#[tokio::test]
+async fn quiet_connect_names_the_jump_host_it_would_ask_about() {
+    let jump = TestServer::start(key(1)).await;
+    let target = TestServer::start(key(2)).await;
+    let home = Home::new();
+    home.write("config", &[block("jump", jump.port, ""), block("test", target.port, "  ProxyJump jump\n")].concat());
+    let p = trusting_with_password();
+    let mgr = home.manager(p.clone());
+    assert!(sign_in_reason(mgr.connect("test", false).await).contains("test via jump"));
+    assert_eq!(p.asked(), (0, 0, 0));
+    assert!(jump.all_closed().await);
+}
+
+async fn status_of(rx: &mut tokio::sync::broadcast::Receiver<vpsfiles_ssh::ConnEvent>, within: Duration) -> Option<ConnStatus> {
+    tokio::time::timeout(within, rx.recv()).await.ok().map(|e| e.unwrap().status)
+}
+
+#[tokio::test]
+async fn dropped_connections_come_back_by_themselves() {
+    let server = TestServer::start(key(1)).await;
+    let home = Home::new();
+    home.config(server.port, "");
+    let p = Arc::new(TestPrompter { password: Some(PASSWORD.into()), remember: true, ..TestPrompter::trusting() });
+    let mgr = home.manager(p.clone());
+    mgr.backend("test").await.unwrap();
+    let mut rx = mgr.subscribe();
+
+    // Network drop, server down for a while: retried with backoff.
+    server.state.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+    server.drop_sessions();
+    let s = Duration::from_secs(5);
+    assert_eq!(status_of(&mut rx, s).await, Some(ConnStatus::Disconnected));
+    assert_eq!(status_of(&mut rx, s).await, Some(ConnStatus::Connecting), "first retry after ~1 s");
+    assert!(matches!(status_of(&mut rx, s).await, Some(ConnStatus::Failed { error: VfsError::NotConnected(_) })));
+    server.state.refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(status_of(&mut rx, s).await, Some(ConnStatus::Connecting), "second retry after ~2 s");
+    assert_eq!(status_of(&mut rx, s).await, Some(ConnStatus::Connected));
+    assert_eq!(p.asked(), (1, 1, 0), "the saved password, no prompt");
+    mgr.backend("test").await.unwrap().home().await.unwrap();
+
+    // disconnect() means "stay disconnected".
+    server.drop_sessions();
+    assert_eq!(status_of(&mut rx, s).await, Some(ConnStatus::Disconnected));
+    mgr.disconnect("test").await;
+    assert_eq!(status_of(&mut rx, Duration::from_millis(1500)).await, None, "no reconnect");
+}
+
+#[tokio::test]
+async fn background_reconnect_stops_when_it_needs_the_user() {
+    let (server, _home, p, mgr) = connected().await; // password typed, not saved
+    mgr.backend("test").await.unwrap();
+    let mut rx = mgr.subscribe();
+    server.drop_sessions();
+    let s = Duration::from_secs(5);
+    assert_eq!(status_of(&mut rx, s).await, Some(ConnStatus::Disconnected));
+    assert_eq!(status_of(&mut rx, s).await, Some(ConnStatus::Connecting));
+    assert!(matches!(status_of(&mut rx, s).await, Some(ConnStatus::Failed { error: VfsError::SignInNeeded(_) })));
+    let tried = server.count(|c| &c.connections);
+    assert_eq!(status_of(&mut rx, Duration::from_millis(2500)).await, None, "no more tries");
+    assert_eq!(server.count(|c| &c.connections), tried);
+    assert_eq!(p.asked(), (1, 1, 0));
 }
 
 // ---- ProxyJump ------------------------------------------------------------
@@ -763,7 +893,106 @@ async fn big_listing_needs_few_round_trips() {
     let listing = fs.list(&root).await.unwrap();
     assert_eq!(listing.len(), 3005);
     assert_eq!(server.count(|c| &c.stats) - stats_before, 5, "only symlinks are stat'ed");
-    assert!(server.count(|c| &c.readdirs) - readdirs_before <= 32);
+    // 31 batches of 100, plus the pipelined READDIRs that come back EOF.
+    let readdirs = server.count(|c| &c.readdirs) - readdirs_before;
+    assert!((32..=31 + 32).contains(&readdirs), "{readdirs}");
+}
+
+async fn bytes_at(fs: &dyn vpsfiles_vfs::Backend, path: &str, offset: u64, n: usize) -> Vec<u8> {
+    let mut r = fs.open_read(path, offset).await.unwrap();
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).await.unwrap();
+    buf
+}
+
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    for _ in 0..100 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for: {what}");
+}
+
+#[tokio::test]
+async fn read_handles_are_reused_while_the_file_is_unchanged() {
+    let server = TestServer::start(key(1)).await;
+    let home = Home::new();
+    home.config(server.port, "");
+    let mut opts = home.options();
+    opts.read_handle_idle = Duration::from_millis(500);
+    let p = Arc::new(TestPrompter { password: Some(PASSWORD.into()), ..TestPrompter::trusting() });
+    let mgr = SshManager::with_options(p, opts);
+    let fs = mgr.backend("test").await.unwrap();
+    let (_g, root) = tmp();
+    let file = format!("{root}/v.bin");
+    std::fs::write(&file, vec![1u8; 100_000]).unwrap();
+    let opens = || server.count(|c| &c.opens);
+    let closes = || server.count(|c| &c.closes);
+
+    // Range-request pattern: stat, read somewhere, drop; again elsewhere.
+    fs.stat(&file).await.unwrap();
+    assert_eq!(bytes_at(&*fs, &file, 0, 10).await, [1; 10]);
+    fs.stat(&file).await.unwrap();
+    assert_eq!(bytes_at(&*fs, &file, 99_990, 10).await, [1; 10]);
+    assert_eq!((opens(), closes()), (1, 0), "one OPEN, handle kept");
+
+    // Replaced (new inode, other size): the stat no longer vouches for the
+    // old handle, which gets closed; the new content is read.
+    std::fs::write(format!("{root}/v.new"), vec![2u8; 50_000]).unwrap();
+    std::fs::rename(format!("{root}/v.new"), &file).unwrap();
+    fs.stat(&file).await.unwrap();
+    assert_eq!(bytes_at(&*fs, &file, 49_990, 10).await, [2; 10]);
+    assert_eq!(opens(), 2);
+    eventually("stale handle closed", || closes() == 1).await;
+
+    // Idle handles expire.
+    eventually("idle handle closed", || closes() == 2).await;
+}
+
+#[tokio::test]
+async fn a_header_read_fetches_no_more_than_it_uses() {
+    let (server, _home, _p, mgr) = connected().await;
+    let fs = mgr.backend("test").await.unwrap();
+    let (_g, root) = tmp();
+    let file = format!("{root}/photo.jpg");
+    std::fs::write(&file, vec![9u8; 4 << 20]).unwrap();
+    let before = server.count(|c| &c.read_bytes);
+    let mut head = Vec::new();
+    fs.open_read(&file, 0).await.unwrap().take(128 << 10).read_to_end(&mut head).await.unwrap();
+    assert_eq!(head.len(), 128 << 10);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.count(|c| &c.read_bytes) - before, 128 << 10, "EXIF-sized read, nothing extra");
+}
+
+#[tokio::test]
+async fn reads_survive_short_answers_and_sizeless_files() {
+    let (server, _home, _p, mgr) = connected().await;
+    let fs = mgr.backend("test").await.unwrap();
+    let (_g, root) = tmp();
+    let file = format!("{root}/odd.bin");
+    let data: Vec<u8> = (0..1_000_003u32).map(|i| (i % 249) as u8).collect();
+    std::fs::write(&file, &data).unwrap();
+    // A server that answers less than asked (an old OpenSSH caps at 64 KiB).
+    server.state.max_read.store(10_007, std::sync::atomic::Ordering::SeqCst);
+    let mut back = Vec::new();
+    fs.open_read(&file, 0).await.unwrap().read_to_end(&mut back).await.unwrap();
+    assert!(back == data, "short reads reassembled ({} bytes)", back.len());
+    let mut tail = Vec::new();
+    fs.open_read(&file, 999_000).await.unwrap().read_to_end(&mut tail).await.unwrap();
+    assert!(tail == data[999_000..]);
+    server.state.max_read.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    // /proc files say size 0 but have content.
+    let mut status = String::new();
+    fs.open_read("/proc/self/status", 0).await.unwrap().read_to_string(&mut status).await.unwrap();
+    assert!(status.contains("Name:"), "{status:?}");
+    // Empty file.
+    std::fs::write(format!("{root}/empty"), "").unwrap();
+    let mut e = Vec::new();
+    fs.open_read(&format!("{root}/empty"), 0).await.unwrap().read_to_end(&mut e).await.unwrap();
+    assert!(e.is_empty());
 }
 
 #[tokio::test]

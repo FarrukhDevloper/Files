@@ -45,11 +45,11 @@
   // Delay the spinner so fast listings don't flash it.
   let showSpinner = $state(false);
   $effect(() => {
-    if (!b.loading) {
+    if (!b.loading && !b.refreshing) {
       showSpinner = false;
       return;
     }
-    const t = setTimeout(() => (showSpinner = true), 150);
+    const t = setTimeout(() => (showSpinner = true), 200);
     return () => clearTimeout(t);
   });
 

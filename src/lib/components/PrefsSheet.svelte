@@ -8,7 +8,7 @@
 
   function setHidden(show: boolean) {
     prefs.showHidden = show;
-    for (const t of tabs.list) t.setHidden(show);
+    for (const t of tabs.all) t.setHidden(show);
   }
 
   function section(key: keyof SidebarSections, on: boolean) {
@@ -41,6 +41,7 @@
         {/each}
       </div>
       <p class="hint">{shortcutLabel("Mod+=")} larger · {shortcutLabel("Mod+-")} smaller · {shortcutLabel("Mod+0")} default</p>
+      <label class="check"><input type="checkbox" bind:checked={prefs.reduceMotion} /> Reduce motion</label>
     </fieldset>
     <div class="row">
       <fieldset>
@@ -63,6 +64,10 @@
       <legend>Files</legend>
       <label class="check"><input type="checkbox" checked={prefs.showHidden} onchange={(e) => setHidden(e.currentTarget.checked)} /> Show hidden files</label>
       <label class="check"><input type="checkbox" bind:checked={prefs.confirmDelete} /> Ask before deleting permanently</label>
+    </fieldset>
+    <fieldset>
+      <legend>Servers</legend>
+      <label class="check"><input type="checkbox" bind:checked={prefs.autoConnect} /> Connect to servers at startup</label>
     </fieldset>
     <fieldset>
       <legend>Window</legend>

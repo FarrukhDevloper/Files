@@ -31,6 +31,12 @@ interface Saved {
   /** Bottom path + status bar (the address bar is in the toolbar). */
   pathBar: boolean;
   startPage: StartPage;
+  /** Connect to every server when the app starts. */
+  autoConnect: boolean;
+  /** Fewer animations (also follows the OS setting). */
+  reduceMotion: boolean;
+  /** List view: a "Git" column inside repositories. */
+  gitColumn: boolean;
 }
 
 const KEY = "vpsfiles.prefs.v1";
@@ -45,6 +51,9 @@ const defaults: Saved = {
   uiScale: 1,
   pathBar: false,
   startPage: "home",
+  autoConnect: true,
+  reduceMotion: false,
+  gitColumn: false,
 };
 
 function load(): Saved {
@@ -68,6 +77,9 @@ class Prefs {
   uiScale = $state(this.#saved.uiScale);
   pathBar = $state(this.#saved.pathBar);
   startPage = $state<StartPage>(this.#saved.startPage);
+  autoConnect = $state(this.#saved.autoConnect);
+  reduceMotion = $state(this.#saved.reduceMotion);
+  gitColumn = $state(this.#saved.gitColumn);
 
   constructor() {
     $effect.root(() => {
@@ -77,6 +89,7 @@ class Prefs {
           sidebarWidth: this.sidebarWidth, theme: this.theme,
           sections: this.sections, confirmDelete: this.confirmDelete,
           uiScale: this.uiScale, pathBar: this.pathBar, startPage: this.startPage,
+          autoConnect: this.autoConnect, reduceMotion: this.reduceMotion, gitColumn: this.gitColumn,
         };
         try { localStorage.setItem(KEY, JSON.stringify(data)); } catch { /* storage unavailable */ }
       });
@@ -84,6 +97,11 @@ class Prefs {
         const root = document.documentElement;
         if (this.theme === "system") delete root.dataset.theme;
         else root.dataset.theme = this.theme;
+      });
+      $effect(() => {
+        const root = document.documentElement;
+        if (this.reduceMotion) root.dataset.motion = "reduce";
+        else delete root.dataset.motion;
       });
       $effect(() => {
         void applyZoom(this.uiScale).catch(() => { /* zoom unsupported: stay at 100 % */ });

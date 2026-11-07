@@ -4,6 +4,7 @@
   import ExternalLink from "@lucide/svelte/icons/external-link";
   import Copy from "@lucide/svelte/icons/copy";
   import Play from "@lucide/svelte/icons/play";
+  import { fade } from "svelte/transition";
   import FileIcon from "./FileIcon.svelte";
   import { openInPlayer, openWithDefaultApp, playerLabel } from "$lib/actions";
   import { api } from "$lib/ipc/api";
@@ -15,6 +16,8 @@
   import { ui } from "$lib/stores/ui.svelte";
   import { toVfsError } from "$lib/util/errors";
   import { rememberFocus, trapTab } from "$lib/util/focus";
+  import { easeOut, ms } from "$lib/util/motion";
+  import { cssZoom } from "$lib/util/zoom";
   import { formatDate, formatSize } from "$lib/util/format";
   import { iconFor, kindLabel, previewKind } from "$lib/util/filetype";
   import { sourceKey } from "$lib/util/path";
@@ -90,6 +93,27 @@
     ui.quickLook = false;
   }
 
+  /** The panel grows out of the item it shows and shrinks back into it. */
+  function zoomFromItem(node: HTMLElement, { path }: { path: string | null }) {
+    const duration = ms(220);
+    const item = path ? document.querySelector<HTMLElement>(`.content [data-path="${CSS.escape(path)}"]`) : null;
+    const to = node.getBoundingClientRect();
+    if (!item || !to.width || !to.height) {
+      return { duration: ms(160), easing: easeOut, css: (t: number) => `opacity: ${t}; transform: scale(${0.96 + 0.04 * t})` };
+    }
+    const from = item.getBoundingClientRect();
+    const z = cssZoom();
+    const s = Math.min(1, Math.max(from.width / to.width, from.height / to.height, 0.05));
+    const dx = (from.left + from.width / 2 - (to.left + to.width / 2)) / z;
+    const dy = (from.top + from.height / 2 - (to.top + to.height / 2)) / z;
+    return {
+      duration,
+      easing: easeOut,
+      css: (t: number, u: number) =>
+        `transform: translate(${dx * u}px, ${dy * u}px) scale(${s + (1 - s) * t}); opacity: ${Math.min(1, t * 1.8)}`,
+    };
+  }
+
   function openExternally() {
     if (entry && b.location) void openWithDefaultApp(entry, b.locationOf(entry));
   }
@@ -112,9 +136,18 @@
 </script>
 
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-<div class="overlay" onclick={(e) => e.target === e.currentTarget && close()}>
+<div class="overlay" onclick={(e) => e.target === e.currentTarget && close()} transition:fade|global={{ duration: ms(160) }}>
   {#if entry}
-    <div class="panel" role="dialog" aria-modal="true" aria-label="Quick Look: {entry.name}" tabindex="-1" bind:this={panel} onkeydown={(e) => trapTab(e, panel)}>
+    <div
+      class="panel"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Quick Look: {entry.name}"
+      tabindex="-1"
+      bind:this={panel}
+      onkeydown={(e) => trapTab(e, panel)}
+      transition:zoomFromItem|global={{ path: entry.path }}
+    >
       <header>
         <button class="tool" aria-label="Close" title="Close (Space)" onclick={close}><X size={16} /></button>
         <h2>{entry.name}</h2>
@@ -182,7 +215,6 @@
     display: grid;
     place-items: center;
     background: var(--bg-overlay);
-    animation: fade 0.12s ease-out;
   }
   .panel:focus-visible { outline: none; }
   .panel {
@@ -194,7 +226,6 @@
     overflow: hidden;
     background: var(--bg-quicklook);
     box-shadow: var(--shadow-sheet);
-    animation: zoom 0.14s ease-out;
   }
   header {
     flex: none;
@@ -256,6 +287,4 @@
     color: var(--fg-secondary);
   }
   .hint { margin-left: auto; color: var(--fg-tertiary); }
-  @keyframes fade { from { opacity: 0; } }
-  @keyframes zoom { from { transform: scale(0.96); opacity: 0; } }
 </style>

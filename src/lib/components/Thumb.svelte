@@ -41,12 +41,17 @@
     src = null;
     handle?.settled(false);
   }
+
+  /** Removing src aborts a download still in flight (scrolled away). */
+  function abortable(img: HTMLImageElement) {
+    return { destroy: () => img.removeAttribute("src") };
+  }
 </script>
 
 <div class="thumb" class:small={size < 32} bind:this={box} style:width="{size}px" style:height="{size}px">
   {#if !loaded}<FileIcon type={iconFor(entry)} {size} link={entry.isSymlink} />{/if}
   {#if src}
-    <img {src} alt="" decoding="async" draggable="false" class:shown={loaded} {onload} {onerror} />
+    <img {src} alt="" decoding="async" draggable="false" class:shown={loaded} {onload} {onerror} use:abortable />
   {/if}
   {#if loaded && video}
     <span class="play" aria-hidden="true"><svg viewBox="0 0 10 10"><path d="M3 2l5 3-5 3z" /></svg></span>
@@ -65,7 +70,8 @@
     background: var(--bg-window);
     opacity: 0;
   }
-  img.shown { position: static; opacity: 1; }
+  img.shown { position: static; opacity: 1; animation: fade-in 0.16s ease-out; }
+  @keyframes fade-in { from { opacity: 0; } }
   .small img { border-radius: 2px; box-shadow: 0 0 0 0.5px var(--border-strong); }
   .play {
     position: absolute;

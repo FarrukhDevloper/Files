@@ -12,12 +12,16 @@ Every command rejects with `VfsError = { code, message }`.
 | Command | Args | Returns |
 |---|---|---|
 | `list_hosts` | — | `HostInfo[]` |
-| `connect_host` | `alias` | — (may trigger `prompt:request`) |
+| `connect_host` | `alias, interactive` | — (interactive may trigger `prompt:request`; non-interactive fails with `cancelled` instead) |
 | `disconnect_host` | `alias` | — |
 | `save_host` | `draft: HostDraft, previousAlias` | `HostInfo` (app hosts only) |
 | `remove_host` | `alias` | — (app hosts only) |
 | `forget_password` | `alias` | — |
 | `ssh_config_path` | — | `string` |
+| `server_info` | `alias` | `ServerInfo` (uptime, load, memory, OS) |
+| `open_terminal` | `location` | — (OS terminal; `ssh -t` into the folder for servers) |
+| `git_info` | `location` | `GitInfo` or `null` |
+| `git_log` | `location, limit` | `GitCommit[]` |
 | `local_places` | — | `Place[]` |
 | `home_dir` | `source: SourceId` | `string` |
 | `list_dir` | `location` | `Entry[]` (unsorted) |
