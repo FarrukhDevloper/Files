@@ -64,6 +64,17 @@ impl AsyncRead for CountingRead {
     }
 }
 
+/// A remote path is POSIX, so on Windows the fake server's local temp dir
+/// arrives as `/C:/…`; hand the local disk `C:/…`.
+fn native(p: &str) -> String {
+    let b = p.as_bytes();
+    if cfg!(windows) && b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        p[1..].to_string()
+    } else {
+        p.to_string()
+    }
+}
+
 #[async_trait]
 impl Backend for Counting {
     fn source(&self) -> SourceId {
@@ -73,31 +84,31 @@ impl Backend for Counting {
         self.inner.home().await
     }
     async fn list(&self, p: &str) -> Result<Vec<Entry>> {
-        self.inner.list(p).await
+        self.inner.list(&native(p)).await
     }
     async fn stat(&self, p: &str) -> Result<Entry> {
         tokio::time::sleep(self.stat_delay).await;
-        self.inner.stat(p).await
+        self.inner.stat(&native(p)).await
     }
     async fn mkdir(&self, p: &str) -> Result<()> {
-        self.inner.mkdir(p).await
+        self.inner.mkdir(&native(p)).await
     }
     async fn remove_file(&self, p: &str) -> Result<()> {
-        self.inner.remove_file(p).await
+        self.inner.remove_file(&native(p)).await
     }
     async fn remove_dir(&self, p: &str) -> Result<()> {
-        self.inner.remove_dir(p).await
+        self.inner.remove_dir(&native(p)).await
     }
     async fn rename(&self, a: &str, b: &str) -> Result<()> {
-        self.inner.rename(a, b).await
+        self.inner.rename(&native(a), &native(b)).await
     }
     async fn open_read(&self, p: &str, offset: u64) -> Result<BoxRead> {
         self.opens.fetch_add(1, Ordering::SeqCst);
-        let inner = self.inner.open_read(p, offset).await?;
+        let inner = self.inner.open_read(&native(p), offset).await?;
         Ok(Box::pin(CountingRead { inner, n: self.read.clone() }))
     }
     async fn open_write(&self, p: &str, mode: WriteMode) -> Result<BoxWrite> {
-        self.inner.open_write(p, mode).await
+        self.inner.open_write(&native(p), mode).await
     }
 }
 
@@ -289,6 +300,8 @@ fn write_shared(shared: &Path, bucket: &str, uri: &str, mtime: i64, img: &RgbIma
     path
 }
 
+// The freedesktop cache is a Linux/BSD feature (off by default elsewhere).
+#[cfg(not(windows))]
 #[tokio::test]
 async fn shared_freedesktop_cache_is_read_and_written() {
     let fs = Counting::new(SourceId::Local);

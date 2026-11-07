@@ -35,7 +35,8 @@ async fn full_and_head() {
     let (_d, root, server, data) = setup().await;
     let url = server.url_for(&loc(&root, CLIP));
     assert!(url.starts_with(&format!("http://127.0.0.1:{}/", server.port())));
-    assert!(url.ends_with("/clip%20%231%20100%25%3F.mp4"), "{url}");
+    let expected = if cfg!(windows) { "/clip%20%231%20100%25.mp4" } else { "/clip%20%231%20100%25%3F.mp4" };
+    assert!(url.ends_with(expected), "{url}");
 
     let r = request(&url, "GET", &[]).await;
     assert_eq!(r.status, 200);
