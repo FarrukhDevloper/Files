@@ -52,6 +52,10 @@ const trees = new Map<string, Node>([
         }),
         Pictures: dir({
           "sunset.jpg": file(2_621_440, 30), "logo.svg": file(4_096, 60),
+          // Odd aspect ratios: every thumbnail must keep one square frame.
+          "tall-portrait.jpg": file(900_000, 2), "wide-panorama.jpg": file(1_400_000, 2),
+          "photo-4x3.jpg": file(700_000, 2), "square.png": file(300_000, 2), "white-page.png": file(20_000, 2),
+          "portrait-video.mp4": file(14_000_000, 2), "cinema-video.mp4": file(31_000_000, 2),
           // Exercises lazy thumbnails: only visible ones may load, 4 at a time.
           Gallery: dir(Object.fromEntries(Array.from({ length: 240 }, (_, i) =>
             [`photo-${String(i).padStart(3, "0")}.jpg`, file(200_000 + i * 1_000, i % 30)]))),
@@ -657,7 +661,15 @@ export function createMockApi(): Api {
       // Public sample media so the player UI can be exercised in a browser.
       const ext = loc.path.split(".").pop()?.toLowerCase();
       if (ext === "mp3") return "https://interactive-examples.mdn.mozilla.net/media/cc0-audio/t-rex-roar.mp3";
-      if (ext === "jpg" || ext === "png" || ext === "webp") return `https://picsum.photos/seed/${encodeURIComponent(loc.path.replace(/[^\w.-]+/g, "-"))}/1600/1000`;
+      const name = loc.path.split("/").pop() ?? "";
+      if (name === "white-page.png") {
+        return `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="800"><rect width="600" height="800" fill="#fff"/><rect x="60" y="80" width="480" height="18" fill="#ddd"/></svg>')}`;
+      }
+      if (ext === "jpg" || ext === "png" || ext === "webp") {
+        const [w, h] = /tall|portrait/.test(name) ? [500, 1600] : /panorama/.test(name) ? [2000, 360]
+          : /4x3/.test(name) ? [800, 600] : /square/.test(name) ? [700, 700] : [1600, 1000];
+        return `https://picsum.photos/seed/${encodeURIComponent(loc.path.replace(/[^\w.-]+/g, "-"))}/${w}/${h}`;
+      }
       return "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm";
     },
 

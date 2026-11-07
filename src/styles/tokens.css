@@ -67,6 +67,9 @@
   --shadow-sheet: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 18px 48px rgba(0, 0, 0, 0.24);
   --shadow-control: 0 0.5px 1px rgba(0, 0, 0, 0.12);
 
+  --thumb-edge: rgba(0, 0, 0, 0.12);
+  --thumb-backdrop: rgba(0, 0, 0, 0.045);
+
   --git-modified: #c98a0c;
   --git-added: #2f9e44;
   --git-untracked: #3a9d6a;
@@ -133,6 +136,8 @@
   --shadow-control: 0 0.5px 1px rgba(0, 0, 0, 0.4);
 
   --dot-off: #67676c;
+  --thumb-edge: rgba(255, 255, 255, 0.14);
+  --thumb-backdrop: rgba(255, 255, 255, 0.06);
   --git-modified: #e2b345;
   --git-added: #56c26a;
   --git-untracked: #6cc596;
@@ -189,6 +194,8 @@
     --shadow-control: 0 0.5px 1px rgba(0, 0, 0, 0.4);
 
     --dot-off: #67676c;
+    --thumb-edge: rgba(255, 255, 255, 0.14);
+    --thumb-backdrop: rgba(255, 255, 255, 0.06);
     --git-modified: #e2b345;
     --git-added: #56c26a;
     --git-untracked: #6cc596;

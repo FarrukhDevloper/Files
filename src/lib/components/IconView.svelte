@@ -12,14 +12,18 @@
   import { clipboard } from "$lib/stores/clipboard.svelte";
   import { dnd } from "$lib/stores/dnd.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
+  import { prefs } from "$lib/stores/prefs.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { iconFor } from "$lib/util/filetype";
   import { sourceKey } from "$lib/util/path";
 
   let { b }: { b: Browser } = $props();
 
-  const CELL_W = 116;
-  const CELL_H = 124;
+  // Cell geometry follows the icon size (Preferences / background menu):
+  // icon box + selection padding, then two label lines below.
+  const ICON = $derived(prefs.iconSize);
+  const CELL_W = $derived(Math.max(100, ICON + 44));
+  const CELL_H = $derived(ICON + 52);
   const PAD = 12;
   const OVERSCAN = 2;
 
@@ -101,6 +105,7 @@
         style:left="{PAD + (i % cols) * cellW}px"
         style:top="{PAD + Math.floor(i / cols) * CELL_H}px"
         style:width="{cellW}px"
+        style:height="{CELL_H}px"
         class:drop={dnd.target?.key === cutPrefix + entry.path}
         class:fresh={b.fresh.has(entry.path)}
         class:leaving={b.leaving.has(entry.path)}
@@ -118,9 +123,9 @@
       >
         <div class="icon">
           {#if b.location && wantsThumbnail(entry, b.location)}
-            <Thumb {entry} location={b.locationOf(entry)} size={72} />
+            <Thumb {entry} location={b.locationOf(entry)} size={ICON} shadow />
           {:else}
-            <FileIcon type={iconFor(entry)} size={72} link={entry.isSymlink} />
+            <FileIcon type={iconFor(entry)} size={ICON} link={entry.isSymlink} />
           {/if}
           {#if b.git?.entries[entry.name]}<span class="git-pos"><GitBadge status={b.git.entries[entry.name]!} round /></span>{/if}
         </div>
@@ -144,7 +149,6 @@
   .spacer { position: relative; contain: layout; }
   .cell {
     position: absolute;
-    height: 124px;
     display: flex;
     flex-direction: column;
     align-items: center;

@@ -10,7 +10,7 @@ import { edits } from "$lib/stores/edits.svelte";
 import type { DropTarget } from "$lib/stores/dnd.svelte";
 import { hosts } from "$lib/stores/hosts.svelte";
 import { listings } from "$lib/stores/listings";
-import { prefs } from "$lib/stores/prefs.svelte";
+import { ICON_SIZES, prefs } from "$lib/stores/prefs.svelte";
 import { tabs } from "$lib/stores/tabs.svelte";
 import { toasts } from "$lib/stores/toasts.svelte";
 import { transfers } from "$lib/stores/transfers.svelte";
@@ -531,6 +531,11 @@ export function backgroundMenu(b: Browser, e: MouseEvent) {
     "separator",
     { label: b.showHidden ? "Hide Hidden Files" : "Show Hidden Files", shortcut: shortcutLabel("Mod+H"), run: () => b.toggleHidden() },
     ...(b.git && b.view === "list" ? [{ label: "Show Git Column", checked: prefs.gitColumn, run: () => (prefs.gitColumn = !prefs.gitColumn) }] : []),
+    ...(b.view === "icons"
+      ? ["separator" as const,
+        ...ICON_SIZES.map((s): MenuItem => ({ label: `${s.label} Icons`, checked: prefs.iconSize === s.size, run: () => (prefs.iconSize = s.size) })),
+        { label: "Crop Thumbnails to Squares", checked: prefs.thumbFit === "fill", run: () => (prefs.thumbFit = prefs.thumbFit === "fill" ? "fit" : "fill") }]
+      : []),
     "separator",
     { label: "Open in Terminal", disabled: !b.location, run: () => b.location && void openTerminalAt(b.location) },
     { label: "Copy Path", run: () => void copyPath(b) },

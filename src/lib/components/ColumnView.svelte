@@ -237,9 +237,9 @@
   {:else if single}
     <div class="col info">
       {#if b.location && wantsThumbnail(single, b.location)}
-        {#key single.path}<Thumb entry={single} location={b.locationOf(single)} size={160} />{/key}
+        {#key single.path}<Thumb entry={single} location={b.locationOf(single)} size={128} shadow />{/key}
       {:else}
-        <FileIcon type={iconFor(single)} size={112} link={single.isSymlink} />
+        <FileIcon type={iconFor(single)} size={128} link={single.isSymlink} />
       {/if}
       <h3 class="selectable">{single.name}</h3>
       <dl>

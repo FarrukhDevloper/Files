@@ -1,6 +1,6 @@
 <script lang="ts">
   import Sheet from "./Sheet.svelte";
-  import { prefs, type SidebarSections } from "$lib/stores/prefs.svelte";
+  import { ICON_SIZES, prefs, type SidebarSections } from "$lib/stores/prefs.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
   import { ui } from "$lib/stores/ui.svelte";
   import { shortcutLabel } from "$lib/util/platform";
@@ -43,6 +43,28 @@
       <p class="hint">{shortcutLabel("Mod+=")} larger · {shortcutLabel("Mod+-")} smaller · {shortcutLabel("Mod+0")} default</p>
       <label class="check"><input type="checkbox" bind:checked={prefs.reduceMotion} /> Reduce motion</label>
     </fieldset>
+    <div class="row">
+      <fieldset>
+        <legend>Thumbnails</legend>
+        <div class="seg" role="radiogroup" aria-label="Thumbnails">
+          {#each [["fill", "Fill"], ["fit", "Fit"]] as const as [value, label] (value)}
+            <label class:on={prefs.thumbFit === value} title={value === "fill" ? "Uniform squares, cropped" : "Whole image, letterboxed"}>
+              <input type="radio" name="thumbs" {value} bind:group={prefs.thumbFit} />{label}
+            </label>
+          {/each}
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Icon size</legend>
+        <div class="seg" role="radiogroup" aria-label="Icon size">
+          {#each ICON_SIZES as s (s.size)}
+            <label class:on={prefs.iconSize === s.size}>
+              <input type="radio" name="icon-size" value={s.size} bind:group={prefs.iconSize} />{s.label}
+            </label>
+          {/each}
+        </div>
+      </fieldset>
+    </div>
     <div class="row">
       <fieldset>
         <legend>New windows and tabs show</legend>

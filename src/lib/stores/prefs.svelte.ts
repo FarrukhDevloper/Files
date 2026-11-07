@@ -13,6 +13,15 @@ export type Theme = "system" | "light" | "dark";
 export interface SidebarSections { favourites: boolean; locations: boolean; servers: boolean }
 /** What new windows and tabs show first. */
 export type StartPage = "home" | "homeFolder";
+/** Fill = cropped to the square (uniform grid); Fit = whole image, letterboxed. */
+export type ThumbFit = "fill" | "fit";
+/** Icon view icon/thumbnail box, CSS px. */
+export const ICON_SIZES = [
+  { size: 56, label: "Small" },
+  { size: 72, label: "Default" },
+  { size: 96, label: "Large" },
+  { size: 128, label: "Huge" },
+] as const;
 
 
 interface Saved {
@@ -37,6 +46,9 @@ interface Saved {
   reduceMotion: boolean;
   /** List view: a "Git" column inside repositories. */
   gitColumn: boolean;
+  thumbFit: ThumbFit;
+  /** Icon view: 56 / 72 / 96 / 128. */
+  iconSize: number;
 }
 
 const KEY = "vpsfiles.prefs.v1";
@@ -54,6 +66,8 @@ const defaults: Saved = {
   autoConnect: true,
   reduceMotion: false,
   gitColumn: false,
+  thumbFit: "fill",
+  iconSize: 72,
 };
 
 function load(): Saved {
@@ -80,6 +94,8 @@ class Prefs {
   autoConnect = $state(this.#saved.autoConnect);
   reduceMotion = $state(this.#saved.reduceMotion);
   gitColumn = $state(this.#saved.gitColumn);
+  thumbFit = $state<ThumbFit>(this.#saved.thumbFit);
+  iconSize = $state(ICON_SIZES.some((s) => s.size === this.#saved.iconSize) ? this.#saved.iconSize : 72);
 
   constructor() {
     $effect.root(() => {
@@ -90,6 +106,7 @@ class Prefs {
           sections: this.sections, confirmDelete: this.confirmDelete,
           uiScale: this.uiScale, pathBar: this.pathBar, startPage: this.startPage,
           autoConnect: this.autoConnect, reduceMotion: this.reduceMotion, gitColumn: this.gitColumn,
+          thumbFit: this.thumbFit, iconSize: this.iconSize,
         };
         try { localStorage.setItem(KEY, JSON.stringify(data)); } catch { /* storage unavailable */ }
       });
