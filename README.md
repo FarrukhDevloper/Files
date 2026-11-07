@@ -18,6 +18,18 @@ copy between any two places, play videos straight from the server and edit remot
 ![Tauri](https://img.shields.io/badge/Tauri-2-24c8db?logo=tauri&logoColor=white)
 ![Svelte](https://img.shields.io/badge/Svelte-5-ff3e00?logo=svelte&logoColor=white)
 
+<p>
+  <a href="https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-setup-x64.exe"><img alt="Download for Windows (.exe)" src="https://img.shields.io/badge/Windows-Download%20.exe-0078D6?style=for-the-badge&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI2ZmZiIgZD0iTTMgM2g4LjR2OC40SDN6TTEyLjYgM0gyMXY4LjRoLTguNHpNMyAxMi42aDguNFYyMUgzek0xMi42IDEyLjZIMjFWMjFoLTguNHoiLz48L3N2Zz4%3D&logoColor=white" height="38" /></a>
+  <a href="https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-x64.msi"><img alt="Download for Windows (.msi)" src="https://img.shields.io/badge/Windows-Download%20.msi-005A9E?style=for-the-badge&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI2ZmZiIgZD0iTTMgM2g4LjR2OC40SDN6TTEyLjYgM0gyMXY4LjRoLTguNHpNMyAxMi42aDguNFYyMUgzek0xMi42IDEyLjZIMjFWMjFoLTguNHoiLz48L3N2Zz4%3D&logoColor=white" height="38" /></a>
+</p>
+<p>
+  <a href="https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-amd64.deb"><img alt="Download for Ubuntu / Debian (.deb)" src="https://img.shields.io/badge/Ubuntu%20%2F%20Debian-Download%20.deb-E95420?style=for-the-badge&logo=ubuntu&logoColor=white" height="38" /></a>
+  <a href="https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-x86_64.AppImage"><img alt="Download AppImage for any Linux" src="https://img.shields.io/badge/Linux-Download%20.AppImage-2C3E50?style=for-the-badge&logo=linux&logoColor=white" height="38" /></a>
+  <a href="https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-x86_64.rpm"><img alt="Download for Fedora / openSUSE (.rpm)" src="https://img.shields.io/badge/Fedora-Download%20.rpm-51A2DA?style=for-the-badge&logo=fedora&logoColor=white" height="38" /></a>
+</p>
+
+<sub>⬆️ Click a button and the download starts right away. Always the latest version. · <a href="https://github.com/FarrukhDevloper/Files/releases">All releases</a></sub>
+
 [📥 Download](#-download) · [✨ Features](#-features) · [📸 Screenshots](#-screenshots) · [🛠️ Develop](#️-develop) · [🗺️ Roadmap](docs/ROADMAP.md)
 
 <picture>
@@ -31,20 +43,20 @@ copy between any two places, play videos straight from the server and edit remot
 
 ## 📥 Download
 
-Get the latest installer from **[Releases](https://github.com/FarrukhDevloper/Files/releases/latest)**:
-
-| | Format | Install |
+| | Direct download | Install |
 |---|---|---|
-| 🪟 **Windows 10 / 11** | `.msi` · `-setup.exe` | Double-click and follow the wizard |
-| 🐧 **Debian / Ubuntu** | `.deb` | `sudo apt install ./VPS*Files*_amd64.deb` |
-| 🎩 **Fedora / openSUSE** | `.rpm` | `sudo dnf install ./VPS*Files*.x86_64.rpm` |
-| 📦 **Any Linux** | `.AppImage` | `chmod +x VPS*Files*.AppImage && ./VPS*Files*.AppImage` |
+| 🪟 **Windows 10 / 11** | [**VPS-Files-setup-x64.exe**](https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-setup-x64.exe) · [.msi](https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-x64.msi) | Double-click and follow the wizard |
+| 🐧 **Ubuntu / Debian** | [**VPS-Files-amd64.deb**](https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-amd64.deb) | `sudo apt install ./VPS-Files-amd64.deb` |
+| 🎩 **Fedora / openSUSE** | [**VPS-Files-x86_64.rpm**](https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-x86_64.rpm) | `sudo dnf install ./VPS-Files-x86_64.rpm` |
+| 📦 **Any Linux** | [**VPS-Files-x86_64.AppImage**](https://github.com/FarrukhDevloper/Files/releases/latest/download/VPS-Files-x86_64.AppImage) | `chmod +x VPS-Files-x86_64.AppImage && ./VPS-Files-x86_64.AppImage` |
 
 > [!NOTE]
 > 🧪 This is an early **preview**. Linux is tested daily against real servers.
 > The Windows build is produced by CI but hasn't been tested on real hardware
 > yet, so please [open an issue](https://github.com/FarrukhDevloper/Files/issues)
-> if anything looks off. 🍎 macOS is on the [roadmap](docs/ROADMAP.md).
+> if anything looks off. The installers aren't code-signed yet: on Windows,
+> SmartScreen may ask you to confirm (**More info → Run anyway**).
+> 🍎 macOS is on the [roadmap](docs/ROADMAP.md).
 
 ---
 
@@ -177,25 +189,6 @@ builds the Windows and Linux installers and attaches them to the GitHub Release.
 The full plan is in **[docs/ROADMAP.md](docs/ROADMAP.md)**.
 
 ---
-
-<details>
-<summary>🇺🇿 <b>O'zbekcha qisqacha</b></summary>
-
-<br/>
-
-**VPS Files** kompyuteringizdagi va serverlaringizdagi fayllarni bitta oynada
-boshqaradigan, Finder uslubidagi tez va yengil fayl menejeri.
-
-- 🔑 `~/.ssh/config` dagi serverlar avtomatik chiqadi va ishga tushganda ulanadi
-- 🔁 Laptop ↔ VPS ↔ VPS orasida nusxalash va ko'chirish
-- 🎬 Serverdagi videoni yuklab olmasdan ko'rish
-- ✏️ Serverdagi faylni o'z editoringizda ochish; saqlaganingizda u serverga qaytadi
-- 🌿 Git: branch, o'zgargan fayllar, tarix
-- 🪶 ~14 MB, ~135 MB RAM, bo'sh turganda CPU ~0 %
-
-📥 Yuklab olish: **[Releases](https://github.com/FarrukhDevloper/Files/releases/latest)** (Windows `.msi`/`.exe`, Linux `.deb`/`.rpm`/`.AppImage`).
-
-</details>
 
 <div align="center">
 <br/>

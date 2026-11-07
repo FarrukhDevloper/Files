@@ -5,7 +5,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -53,4 +52,29 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "VPS Files ${{ github.ref_name }}"
           releaseDraft: false
-          prerelease: true
+          # Must be a full release: /releases/latest/download/* (the README
+          # buttons) ignores pre-releases.
+          prerelease: false
+
+      # Versionless copies so README buttons can point at
+      # /releases/latest/download/<name> and start the download directly.
+      - name: 🔗 Upload stable download names
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          b=target/release/bundle
+          mkdir -p stable
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            exe=( "$b"/nsis/*-setup.exe ); msi=( "$b"/msi/*.msi )
+            cp "${exe[0]}" stable/VPS-Files-setup-x64.exe
+            cp "${msi[0]}" stable/VPS-Files-x64.msi
+          else
+            deb=( "$b"/deb/*.deb ); rpm=( "$b"/rpm/*.rpm ); app=( "$b"/appimage/*.AppImage )
+            cp "${deb[0]}" stable/VPS-Files-amd64.deb
+            cp "${rpm[0]}" stable/VPS-Files-x86_64.rpm
+            cp "${app[0]}" stable/VPS-Files-x86_64.AppImage
+          fi
+          gh release upload "$TAG" stable/* --clobber

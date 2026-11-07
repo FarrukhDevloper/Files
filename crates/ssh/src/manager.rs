@@ -836,7 +836,8 @@ pub(crate) enum ClientError {
     Ssh(russh::Error),
     Vfs(VfsError),
     /// Not in known_hosts yet; the handshake stops so we can ask the user.
-    UnknownHostKey(PublicKey),
+    /// Boxed: a key is large and this error travels through every `?`.
+    UnknownHostKey(Box<PublicKey>),
 }
 
 impl From<russh::Error> for ClientError {
@@ -907,7 +908,7 @@ impl client::Handler for Client {
         };
         match known_hosts::check(&self.known_hosts, &self.hostname, self.port, key) {
             Check::Known => Ok(true),
-            Check::Unknown => Err(ClientError::UnknownHostKey(key.clone())),
+            Check::Unknown => Err(ClientError::UnknownHostKey(Box::new(key.clone()))),
             Check::Changed => Err(ClientError::Vfs(VfsError::HostKey(format!(
                 "{}: the {} host key of {} changed (now {}). This can mean someone is \
                  intercepting the connection. If the server was reinstalled, remove its old \
