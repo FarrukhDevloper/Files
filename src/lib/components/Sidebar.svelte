@@ -1,26 +1,14 @@
 <script lang="ts">
-  import type { Component } from "svelte";
-  import House from "@lucide/svelte/icons/house";
-  import Monitor from "@lucide/svelte/icons/monitor";
-  import FileText from "@lucide/svelte/icons/file-text";
-  import Download from "@lucide/svelte/icons/download";
-  import ImageIcon from "@lucide/svelte/icons/image";
-  import Music from "@lucide/svelte/icons/eighth-notes";
-  import Film from "@lucide/svelte/icons/film";
-  import Laptop from "@lucide/svelte/icons/laptop-minimal";
-  import HardDrive from "@lucide/svelte/icons/hard-drive";
   import Server from "@lucide/svelte/icons/server";
-  import { hostMenu, openHost, openPlace } from "$lib/actions";
-  import type { PlaceKind, Place, HostInfo } from "$lib/ipc/types";
+  import Plus from "@lucide/svelte/icons/plus";
+  import { placeIcons, placeLabel, StartIcon } from "./places";
+  import { addServer, hostAddress, hostMenu, openHost, openPlace } from "$lib/actions";
+  import type { Place, HostInfo } from "$lib/ipc/types";
   import { dnd } from "$lib/stores/dnd.svelte";
   import { hosts } from "$lib/stores/hosts.svelte";
   import { prefs } from "$lib/stores/prefs.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
-
-  const placeIcons: Record<PlaceKind, Component<{ size?: number; strokeWidth?: number }>> = {
-    home: House, desktop: Monitor, documents: FileText, downloads: Download,
-    pictures: ImageIcon, music: Music, videos: Film, root: Laptop, drive: HardDrive,
-  };
+  import { cssZoom } from "$lib/util/zoom";
 
   const b = $derived(tabs.current);
 
@@ -35,7 +23,7 @@
   }
 
   function hostTitle(h: HostInfo): string {
-    const target = `${h.user ? `${h.user}@` : ""}${h.hostname}${h.port !== 22 ? `:${h.port}` : ""}`;
+    const target = hostAddress(h);
     if (h.status.state === "failed") return `${target}\n${h.status.error.message}`;
     return `${target} — ${h.status.state}`;
   }
@@ -58,8 +46,9 @@
     handle.setPointerCapture(e.pointerId);
     const startX = e.clientX;
     const startW = prefs.sidebarWidth;
+    const z = cssZoom();
     const move = (ev: PointerEvent) => {
-      prefs.sidebarWidth = Math.round(Math.min(360, Math.max(160, startW + ev.clientX - startX)));
+      prefs.sidebarWidth = Math.round(Math.min(380, Math.max(170, startW + (ev.clientX - startX) / z)));
     };
     const up = () => {
       handle.removeEventListener("pointermove", move);
@@ -75,6 +64,11 @@
 <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 <nav class="sidebar" style:width="{prefs.sidebarWidth}px" aria-label="Sidebar" onkeydown={roving}>
   <div class="scroll">
+    <button class="item start" class:active={b.home} onclick={() => b.showHome()} title="Home: this computer and your servers">
+      <span class="icon"><StartIcon size={18} strokeWidth={1.8} /></span>
+      <span class="label">Home</span>
+    </button>
+
     {#if prefs.sections.favourites && hosts.favourites.length}
       <h3>Favourites</h3>
       {#each hosts.favourites as p (p.path)}
@@ -89,8 +83,8 @@
           onclick={() => openPlace(b, p)}
           title={p.path}
         >
-          <span class="icon"><Icon size={16} strokeWidth={1.8} /></span>
-          <span class="label">{p.label}</span>
+          <span class="icon"><Icon size={18} strokeWidth={1.8} /></span>
+          <span class="label">{placeLabel(p)}</span>
         </button>
       {/each}
     {/if}
@@ -109,14 +103,17 @@
           onclick={() => openPlace(b, p)}
           title={p.path}
         >
-          <span class="icon"><Icon size={16} strokeWidth={1.8} /></span>
-          <span class="label">{p.label}</span>
+          <span class="icon"><Icon size={18} strokeWidth={1.8} /></span>
+          <span class="label">{placeLabel(p)}</span>
         </button>
       {/each}
     {/if}
 
     {#if prefs.sections.servers}
-    <h3>Servers</h3>
+    <div class="head">
+      <h3>Servers</h3>
+      <button class="add" title="Add Server…" aria-label="Add server" onclick={addServer}><Plus size={14} strokeWidth={2.2} /></button>
+    </div>
     {#each hosts.list as h (h.alias)}
       <button
         class="item"
@@ -128,17 +125,17 @@
         oncontextmenu={(e) => hostMenu(b, e, h.alias)}
         title={hostTitle(h)}
       >
-        <span class="icon"><Server size={16} strokeWidth={1.8} /></span>
+        <span class="icon"><Server size={18} strokeWidth={1.8} /></span>
         <span class="label">{h.alias}</span>
         <span class="dot {h.status.state}" role="img" aria-label={h.status.state}></span>
       </button>
     {:else}
-      <p class="empty">No hosts in ~/.ssh/config</p>
+      <button class="empty" onclick={addServer}>No servers yet. Add one…</button>
     {/each}
     {/if}
   </div>
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="resize" onpointerdown={startResize} ondblclick={() => (prefs.sidebarWidth = 220)}></div>
+  <div class="resize" onpointerdown={startResize} ondblclick={() => (prefs.sidebarWidth = 230)}></div>
 </nav>
 
 <style>
@@ -158,11 +155,25 @@
     font-weight: 600;
     color: var(--fg-tertiary);
   }
-  h3:first-child { margin-top: 4px; }
+  .start { margin-bottom: 2px; }
+  .head { display: flex; align-items: center; justify-content: space-between; }
+  .head h3 { flex: 1; }
+  .add {
+    display: grid;
+    place-items: center;
+    width: 20px;
+    height: 20px;
+    margin: 10px 4px 0 0;
+    border-radius: 5px;
+    color: var(--fg-tertiary);
+    opacity: 0;
+  }
+  .sidebar:hover .add, .add:focus-visible { opacity: 1; }
+  .add:hover { background: var(--bg-hover); color: var(--fg-primary); }
   .item {
     display: flex;
     align-items: center;
-    gap: 7px;
+    gap: 8px;
     width: 100%;
     height: var(--side-row-h);
     padding: 0 8px;
@@ -176,7 +187,8 @@
   .item.drop .icon { color: inherit; }
   .icon { display: grid; place-items: center; color: var(--fg-side-icon); }
   .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .empty { margin: 4px 8px; color: var(--fg-tertiary); font-size: var(--fs-small); }
+  .empty { margin: 4px 8px; padding: 0; color: var(--fg-tertiary); font-size: var(--fs-small); text-align: left; }
+  .empty:hover { color: var(--accent); }
   .resize {
     position: absolute;
     top: 0;

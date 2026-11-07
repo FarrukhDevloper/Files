@@ -1,7 +1,9 @@
 // Persisted preferences (Preferences sheet, Mod+,) plus remembered UI state
-// (sort, sidebar width).
+// (sort, sidebar width, interface size).
 // Per-viewer convenience only: storage may be unavailable, so every access
 // is guarded and the defaults always work.
+
+import { applyZoom } from "$lib/util/zoom";
 
 export type ViewMode = "icons" | "list" | "columns";
 export type SortKey = "name" | "modified" | "size" | "kind";
@@ -9,6 +11,9 @@ export interface Sort { key: SortKey; asc: boolean }
 export type Theme = "system" | "light" | "dark";
 
 export interface SidebarSections { favourites: boolean; locations: boolean; servers: boolean }
+/** What new windows and tabs show first. */
+export type StartPage = "home" | "homeFolder";
+
 
 interface Saved {
   /** View for new tabs and at launch. */
@@ -21,6 +26,11 @@ interface Saved {
   sections: SidebarSections;
   /** Ask before deleting permanently (servers, Shift+Delete). */
   confirmDelete: boolean;
+  /** Interface size: 0.9 / 1 / 1.15 / 1.3 (see util/zoom.ts). */
+  uiScale: number;
+  /** Bottom path + status bar (the address bar is in the toolbar). */
+  pathBar: boolean;
+  startPage: StartPage;
 }
 
 const KEY = "vpsfiles.prefs.v1";
@@ -28,10 +38,13 @@ const defaults: Saved = {
   view: "list",
   sort: { key: "name", asc: true },
   showHidden: false,
-  sidebarWidth: 220,
+  sidebarWidth: 230,
   theme: "system",
   sections: { favourites: true, locations: true, servers: true },
   confirmDelete: true,
+  uiScale: 1,
+  pathBar: false,
+  startPage: "home",
 };
 
 function load(): Saved {
@@ -52,6 +65,9 @@ class Prefs {
   theme = $state<Theme>(this.#saved.theme);
   sections = $state.raw<SidebarSections>({ ...defaults.sections, ...this.#saved.sections });
   confirmDelete = $state(this.#saved.confirmDelete);
+  uiScale = $state(this.#saved.uiScale);
+  pathBar = $state(this.#saved.pathBar);
+  startPage = $state<StartPage>(this.#saved.startPage);
 
   constructor() {
     $effect.root(() => {
@@ -60,6 +76,7 @@ class Prefs {
           view: this.view, sort: this.sort, showHidden: this.showHidden,
           sidebarWidth: this.sidebarWidth, theme: this.theme,
           sections: this.sections, confirmDelete: this.confirmDelete,
+          uiScale: this.uiScale, pathBar: this.pathBar, startPage: this.startPage,
         };
         try { localStorage.setItem(KEY, JSON.stringify(data)); } catch { /* storage unavailable */ }
       });
@@ -67,6 +84,9 @@ class Prefs {
         const root = document.documentElement;
         if (this.theme === "system") delete root.dataset.theme;
         else root.dataset.theme = this.theme;
+      });
+      $effect(() => {
+        void applyZoom(this.uiScale).catch(() => { /* zoom unsupported: stay at 100 % */ });
       });
     });
   }

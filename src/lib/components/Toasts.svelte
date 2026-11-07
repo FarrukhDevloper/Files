@@ -55,8 +55,8 @@
   .error .icon { color: var(--danger); }
   .text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   strong { font-weight: 600; overflow-wrap: anywhere; }
-  p { margin: 0; font-size: 12px; color: var(--fg-secondary); white-space: pre-line; overflow-wrap: anywhere; max-height: 7.5em; overflow: hidden; }
-  .action { align-self: flex-start; margin-top: 4px; color: var(--accent); font-weight: 550; font-size: 12px; }
+  p { margin: 0; font-size: var(--fs-secondary); color: var(--fg-secondary); white-space: pre-line; overflow-wrap: anywhere; max-height: 7.5em; overflow: hidden; }
+  .action { align-self: flex-start; margin-top: 4px; color: var(--accent); font-weight: 550; font-size: var(--fs-secondary); }
   .close { flex: none; align-self: flex-start; display: grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; color: var(--fg-tertiary); }
   .close:hover { background: var(--bg-hover); color: var(--fg-primary); }
   @keyframes rise { from { transform: translateY(6px); opacity: 0; } }

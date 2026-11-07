@@ -34,8 +34,7 @@ export function handleFileDrag(e: FileDragEvent) {
     return;
   }
   if (blocked()) return;
-  const x = e.position.x / devicePixelRatio;
-  const y = e.position.y / devicePixelRatio;
+  const { x, y } = e.position;
   if (e.type !== "drop") {
     dnd.externalAt(x, y);
     return;

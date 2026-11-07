@@ -65,7 +65,7 @@
   .rename {
     min-width: 80px;
     width: 100%;
-    height: 20px;
+    height: 24px;
     margin: 0 -3px;
     padding: 0 3px;
     border: 0;

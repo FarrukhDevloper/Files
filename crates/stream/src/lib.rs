@@ -7,8 +7,14 @@
 //! every segment is percent-encoded; the path's own `/`s are kept, so
 //! relative references (subtitles, HLS segments) resolve. Requests without
 //! the random per-launch token get 404.
+//!
+//! Thumbnails: `/{token}/thumb/{size}/{source}/{path segments}`, size
+//! clamped to 32..=512; any query (the UI's `?v=mtime`) is ignored.
+
+mod thumb;
 
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -21,6 +27,25 @@ use vpsfiles_vfs::{BackendResolver, EntryKind, Location, Result, SourceId, VfsEr
 /// Bytes per body chunk read from the backend.
 const CHUNK: usize = 256 * 1024;
 
+/// Thumbnails cost (and the cache may delete) nothing but what is here.
+#[derive(Debug, Clone)]
+pub struct MediaOptions {
+    /// Disk cache for thumbnails; `None` = render every time.
+    pub thumb_cache: Option<PathBuf>,
+    /// `ffmpeg` for video thumbnails; `None` = images only.
+    pub ffmpeg: Option<PathBuf>,
+}
+
+impl Default for MediaOptions {
+    /// `<cache dir>/vps-files/thumbs` and `ffmpeg` from `PATH`.
+    fn default() -> Self {
+        Self {
+            thumb_cache: dirs::cache_dir().map(|d| d.join("vps-files").join("thumbs")),
+            ffmpeg: thumb::find_program("ffmpeg"),
+        }
+    }
+}
+
 pub struct MediaServer {
     port: u16,
     token: String,
@@ -29,19 +54,45 @@ pub struct MediaServer {
 
 struct Ctx {
     token: String,
+    port: u16,
     resolver: Arc<dyn BackendResolver>,
+    thumbs: thumb::Thumbnailer,
+}
+
+impl Ctx {
+    fn media_url(&self, loc: &Location) -> String {
+        media_url(self.port, &self.token, loc)
+    }
+}
+
+fn base_url(port: u16, token: &str) -> String {
+    format!("http://127.0.0.1:{port}/{token}")
+}
+
+fn media_url(port: u16, token: &str, loc: &Location) -> String {
+    let segments: Vec<String> = loc.path.strip_prefix('/').unwrap_or(&loc.path).split('/').map(encode).collect();
+    format!("{}/{}/{}", base_url(port, token), encode(&loc.source.to_string()), segments.join("/"))
 }
 
 impl MediaServer {
-    /// Bind `127.0.0.1:0` and serve in a background task.
+    /// Bind `127.0.0.1:0` and serve in a background task, with the default
+    /// [`MediaOptions`].
     pub async fn start(resolver: Arc<dyn BackendResolver>) -> Result<Self> {
+        Self::start_with(resolver, MediaOptions::default()).await
+    }
+
+    pub async fn start_with(resolver: Arc<dyn BackendResolver>, options: MediaOptions) -> Result<Self> {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .map_err(|e| VfsError::Io(format!("media server: {e}")))?;
         let port = listener.local_addr().map_err(|e| VfsError::Io(format!("media server: {e}")))?.port();
         // 122 random bits from the OS RNG.
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let ctx = Arc::new(Ctx { token: token.clone(), resolver });
+        if options.ffmpeg.is_none() {
+            tracing::info!("ffmpeg not found: no video thumbnails");
+        }
+        let thumbs = thumb::Thumbnailer::new(options.thumb_cache, options.ffmpeg);
+        let ctx = Arc::new(Ctx { token: token.clone(), port, resolver, thumbs });
         let app = axum::Router::new().fallback(serve).with_state(ctx);
         let task = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -56,16 +107,14 @@ impl MediaServer {
         self.port
     }
 
+    /// `http://127.0.0.1:PORT/TOKEN`, no trailing slash; the UI appends
+    /// `/{source}/{path}` or `/thumb/{size}/{source}/{path}`.
+    pub fn base_url(&self) -> String {
+        base_url(self.port, &self.token)
+    }
+
     pub fn url_for(&self, loc: &Location) -> String {
-        let segments: Vec<String> =
-            loc.path.strip_prefix('/').unwrap_or(&loc.path).split('/').map(encode).collect();
-        format!(
-            "http://127.0.0.1:{}/{}/{}/{}",
-            self.port,
-            self.token,
-            encode(&loc.source.to_string()),
-            segments.join("/")
-        )
+        media_url(self.port, &self.token, loc)
     }
 }
 
@@ -123,11 +172,30 @@ fn same_token(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn parse_location(raw_path: &str, token: &str) -> Option<Location> {
-    let mut parts = raw_path.strip_prefix('/')?.split('/');
-    if !same_token(parts.next()?, token) {
+#[derive(Debug, PartialEq, Eq)]
+enum Request {
+    Media(Location),
+    Thumb { size: u32, loc: Location },
+}
+
+fn parse_request(raw_path: &str, token: &str) -> Option<Request> {
+    let (tok, rest) = raw_path.strip_prefix('/')?.split_once('/')?;
+    if !same_token(tok, token) {
         return None;
     }
+    // Unambiguous: a source is `local` or `ssh:…`.
+    let Some(rest) = rest.strip_prefix("thumb/") else { return parse_location(rest).map(Request::Media) };
+    let (size, rest) = rest.split_once('/')?;
+    if size.is_empty() || size.len() > 6 || !size.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let size = size.parse::<u32>().ok()?.clamp(thumb::MIN_SIZE, thumb::MAX_SIZE);
+    Some(Request::Thumb { size, loc: parse_location(rest)? })
+}
+
+/// `{source}/{segments}` (the part after the token).
+fn parse_location(rest: &str) -> Option<Location> {
+    let mut parts = rest.split('/');
     let source: SourceId = decode(parts.next()?)?.parse().ok()?;
     let segments: Vec<String> = parts.map(decode).collect::<Option<_>>()?;
     if segments.iter().any(|s| s == "." || s == "..") {
@@ -226,7 +294,7 @@ fn body_from(reader: impl AsyncRead + Send + Unpin + 'static, len: u64) -> Body 
 }
 
 async fn serve(State(ctx): State<Arc<Ctx>>, method: Method, headers: HeaderMap, uri: Uri) -> Response {
-    let Some(loc) = parse_location(uri.path(), &ctx.token) else {
+    let Some(request) = parse_request(uri.path(), &ctx.token) else {
         return plain(StatusCode::NOT_FOUND, "not found");
     };
     if method != Method::GET && method != Method::HEAD {
@@ -234,13 +302,42 @@ async fn serve(State(ctx): State<Arc<Ctx>>, method: Method, headers: HeaderMap, 
         r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
         return r;
     }
-    match respond(&ctx, &loc, method == Method::HEAD, headers.get(header::RANGE)).await {
+    let head = method == Method::HEAD;
+    let (loc, result) = match request {
+        Request::Media(loc) => {
+            let r = respond(&ctx, &loc, head, headers.get(header::RANGE)).await;
+            (loc, r)
+        }
+        Request::Thumb { size, loc } => {
+            let r = thumbnail(&ctx, &loc, size, head).await;
+            (loc, r)
+        }
+    };
+    match result {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!("media {}{}: {e}", loc.source, loc.path);
             error_response(e)
         }
     }
+}
+
+async fn thumbnail(ctx: &Ctx, loc: &Location, size: u32, head: bool) -> Result<Response> {
+    let fs = ctx.resolver.backend(&loc.source).await?;
+    let Some(thumb) = ctx.thumbs.get(&*fs, loc, size, &ctx.media_url(loc)).await? else {
+        // Final for this file version: the UI's URL changes with its mtime.
+        let mut r = plain(StatusCode::NOT_FOUND, "no thumbnail");
+        r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=86400"));
+        return Ok(r);
+    };
+    let len = thumb.bytes.len();
+    let content_type = thumb.content_type();
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::CACHE_CONTROL, "max-age=31536000, immutable")
+        .body(if head { Body::empty() } else { Body::from(thumb.bytes) })
+        .map_err(|e| VfsError::Other(format!("thumbnail response: {e}")))
 }
 
 async fn respond(ctx: &Ctx, loc: &Location, head: bool, range: Option<&HeaderValue>) -> Result<Response> {
@@ -306,8 +403,11 @@ mod tests {
 
     #[test]
     fn locations_round_trip() {
-        let tok = "t0k";
-        let p = |s: &str| parse_location(s, tok);
+        let p = |s: &str| match parse_request(s, "t0k") {
+            Some(Request::Media(loc)) => Some(loc),
+            Some(Request::Thumb { .. }) => panic!("{s} is not a thumbnail"),
+            None => None,
+        };
         assert_eq!(p("/t0k/local/home/me/a%20b.mp4"), Some(Location::local("/home/me/a b.mp4")));
         assert_eq!(p("/t0k/ssh%3Atanla/srv/x"), Some(Location::new(SourceId::ssh("tanla"), "/srv/x")));
         assert_eq!(p("/t0k/ssh:tanla/"), Some(Location::new(SourceId::ssh("tanla"), "/")));
@@ -320,6 +420,24 @@ mod tests {
         assert_eq!(p("/t0k/local/%ff"), None);
         // Remote paths are POSIX even if a dir is literally named "C:".
         assert_eq!(p("/t0k/ssh:h/C%3A/x"), Some(Location::new(SourceId::ssh("h"), "/C:/x")));
+        // encodeURIComponent leaves !'()* alone.
+        assert_eq!(p("/t0k/local/a%20(1)!'*.jpg"), Some(Location::local("/a (1)!'*.jpg")));
+    }
+
+    #[test]
+    fn thumbnail_requests() {
+        let t = |s: &str| parse_request(s, "t0k");
+        let thumb = |size, path: &str| Some(Request::Thumb { size, loc: Location::local(path) });
+        assert_eq!(t("/t0k/thumb/128/local/a/b.png"), thumb(128, "/a/b.png"));
+        assert_eq!(t("/t0k/thumb/1/local/x.png"), thumb(32, "/x.png"));
+        assert_eq!(t("/t0k/thumb/99999/local/x.png"), thumb(512, "/x.png"));
+        assert_eq!(
+            t("/t0k/thumb/64/ssh%3Atanla/srv/v.mp4"),
+            Some(Request::Thumb { size: 64, loc: Location::new(SourceId::ssh("tanla"), "/srv/v.mp4") })
+        );
+        for bad in ["/t0k/thumb/x/local/a", "/t0k/thumb/-1/local/a", "/t0k/thumb//local/a", "/t0k/thumb/64", "/bad/thumb/64/local/a"] {
+            assert_eq!(t(bad), None, "{bad}");
+        }
     }
 
     #[test]

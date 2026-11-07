@@ -138,10 +138,10 @@
     justify-content: space-between;
     padding: 10px 14px 6px;
   }
-  h2 { margin: 0; font-size: 13px; font-weight: 650; }
-  .link { color: var(--accent); font-size: 12px; }
+  h2 { margin: 0; font-size: var(--fs-ui); font-weight: 650; }
+  .link { color: var(--accent); font-size: var(--fs-secondary); }
   .link:disabled { color: var(--fg-tertiary); }
-  .empty { margin: 4px 14px 14px; color: var(--fg-secondary); font-size: 12px; }
+  .empty { margin: 4px 14px 14px; color: var(--fg-secondary); font-size: var(--fs-secondary); }
   ul { list-style: none; margin: 0; padding: 0 6px 6px; overflow-y: auto; }
   li {
     display: flex;

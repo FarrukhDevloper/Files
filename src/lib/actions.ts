@@ -2,9 +2,10 @@
 // toolbar and the views. Each one reports failures as toasts.
 
 import { api } from "$lib/ipc/api";
-import type { Entry, Location, Place, SourceId, TransferOp } from "$lib/ipc/types";
+import type { Entry, HostInfo, Location, Place, SourceId, TransferOp } from "$lib/ipc/types";
 import type { Browser } from "$lib/stores/browser.svelte";
 import { clipboard } from "$lib/stores/clipboard.svelte";
+import { edits } from "$lib/stores/edits.svelte";
 import type { DropTarget } from "$lib/stores/dnd.svelte";
 import { hosts } from "$lib/stores/hosts.svelte";
 import { prefs } from "$lib/stores/prefs.svelte";
@@ -13,7 +14,7 @@ import { toasts } from "$lib/stores/toasts.svelte";
 import { transfers } from "$lib/stores/transfers.svelte";
 import { ui, type ConflictAction, type MenuItem } from "$lib/stores/ui.svelte";
 import { previewKind } from "$lib/util/filetype";
-import { plural } from "$lib/util/format";
+import { formatSize, plural } from "$lib/util/format";
 import { ancestors, baseName, isRoot, joinPath, parentPath, sameLocation, sameSource, sourceLabel } from "$lib/util/path";
 import { isMac, shortcutLabel } from "$lib/util/platform";
 
@@ -42,6 +43,16 @@ export async function openHost(b: Browser, alias: string) {
   }
 }
 
+/** What a new window or tab shows first (Preferences → start page). */
+export function openStart(b: Browser) {
+  if (prefs.startPage === "home") b.showHome();
+  else void openLocalHome(b);
+}
+
+export function newTab(from: Browser = tabs.current) {
+  openStart(tabs.open(from));
+}
+
 export async function openLocalHome(b: Browser) {
   try {
     const home = await api.homeDir(local);
@@ -52,20 +63,78 @@ export async function openLocalHome(b: Browser) {
   }
 }
 
-/** Enter / double-click. Folders navigate; local files open in the OS app;
- *  remote files open in Quick Look (stream, don't download). */
+/** Above this, opening a remote file in an app asks first (it downloads). */
+const BIG_DOWNLOAD = 200 * 1000 * 1000;
+
+/** Enter / double-click. Folders navigate. Files open in the OS default app:
+ *  local ones in place, remote ones as a synced temp copy. Remote audio and
+ *  video stream into an external player instead, else into Quick Look. */
 export async function openEntry(b: Browser, entry: Entry) {
   const loc = b.locationOf(entry);
   if (entry.kind === "dir") {
     await b.go(loc);
-  } else if (loc.source.kind === "local") {
-    await api.openExternal(loc).catch((e) => toasts.error(e, `Couldn't open “${entry.name}”`));
-  } else if (previewKind(entry) !== "none") {
-    b.selectOnly(entry.path);
-    ui.quickLook = true;
-  } else {
-    toasts.info(`“${entry.name}” is on ${loc.source.host}`, "Copy it to this computer to open it with an app.");
+    return;
   }
+  const kind = previewKind(entry);
+  if (loc.source.kind === "ssh" && (kind === "video" || kind === "audio")) {
+    if (edits.players.length) {
+      await openInPlayer(entry, loc, null);
+    } else {
+      b.selectOnly(entry.path);
+      ui.quickLook = true;
+    }
+    return;
+  }
+  await openWithDefaultApp(entry, loc);
+}
+
+export async function openWithDefaultApp(entry: Entry, loc: Location) {
+  if (loc.source.kind === "ssh" && entry.size > BIG_DOWNLOAD) {
+    const ok = await ui.confirm({
+      title: `Download “${entry.name}” to open it?`,
+      message: `It is ${formatSize(entry.size)}. A copy is downloaded from ${loc.source.host} and opened in its app; your saves are uploaded back.`,
+      confirm: "Download & Open",
+    });
+    if (!ok) return;
+  }
+  try {
+    if (loc.source.kind === "local") await api.openExternal(loc);
+    else await edits.start(loc);
+  } catch (e) {
+    toasts.error(e, `Couldn't open “${entry.name}”`);
+  }
+}
+
+/** Stream into an external player (`null` = the first one found). */
+export async function openInPlayer(entry: Entry, loc: Location, player: string | null) {
+  try {
+    await api.openInPlayer(loc, player);
+  } catch (e) {
+    toasts.error(e, `Couldn't play “${entry.name}”`);
+  }
+}
+
+/** "vlc" → "VLC"; unknown names keep their spelling. */
+export function playerLabel(player: string): string {
+  const known: Record<string, string> = { vlc: "VLC", mpv: "mpv", iina: "IINA", celluloid: "Celluloid", totem: "Videos", smplayer: "SMPlayer", haruna: "Haruna" };
+  return known[player.toLowerCase()] ?? player;
+}
+
+/** "Open with …" items for one file: the default app and each player. */
+function openWithItems(b: Browser, entry: Entry): MenuItem[] {
+  if (entry.kind !== "file") return [];
+  const loc = b.locationOf(entry);
+  const kind = previewKind(entry);
+  const media = kind === "video" || kind === "audio";
+  const items: MenuItem[] = [];
+  // Plain "Open" already uses the default app, except for remote media.
+  if (media && loc.source.kind === "ssh") {
+    items.push({ label: "Open with Default App", run: () => void openWithDefaultApp(entry, loc) });
+  }
+  if (media) {
+    for (const p of edits.players) items.push({ label: `Open with ${playerLabel(p)}`, run: () => void openInPlayer(entry, loc, p) });
+  }
+  return items;
 }
 
 export async function openSelection(b: Browser) {
@@ -285,12 +354,12 @@ export function openPreferences() {
   ui.sheet = { kind: "prefs" };
 }
 
-export function goToFolder(b: Browser) {
-  if (!b.location) return;
-  ui.sheet = { kind: "goto", location: b.location };
+/** Mod+L: edit the address bar. */
+export function goToFolder() {
+  ui.editAddress();
 }
 
-/** Go-to-folder sheet: absolute path, "~" = home of the current source. */
+/** Address bar: absolute path, "~" = home of `source`. */
 export async function goToPath(b: Browser, source: SourceId, typed: string): Promise<boolean> {
   let path = typed.trim();
   if (!path) return false;
@@ -327,6 +396,7 @@ export function entryMenu(b: Browser, e: MouseEvent, entry: Entry) {
   const dir = single && sel[0]!.kind === "dir" ? sel[0]! : null;
   const items: MenuItem[] = [
     { label: "Open", shortcut: "Enter", run: () => void openSelection(b) },
+    ...(single ? openWithItems(b, sel[0]!) : []),
     ...(dir ? [{ label: "Open in New Tab", run: () => void tabs.open(b, b.locationOf(dir)) }] : []),
     { label: "Quick Look", shortcut: "Space", disabled: !single, run: () => toggleQuickLook(b) },
     { label: "Get Info", shortcut: shortcutLabel("Mod+I"), disabled: !single, run: () => getInfo(b) },
@@ -374,18 +444,104 @@ export function hostMenu(b: Browser, e: MouseEvent, alias: string) {
   const host = hosts.get(alias);
   if (!host) return;
   const state = host.status.state;
+  const app = host.origin === "app";
   const items: MenuItem[] = [
     { label: "Open", run: () => void openHost(b, alias) },
     state === "connected" || state === "connecting"
       ? { label: "Disconnect", run: () => void disconnectHost(b, alias) }
-      : { label: "Connect", run: () => void hosts.connect(alias).catch((err) => toasts.error(err, `Couldn't connect to “${alias}”`)) },
+      : { label: "Connect", run: () => void connectHost(alias) },
     "separator",
+    app
+      ? { label: "Edit Server…", run: () => editServer(alias) }
+      : { label: "Edit ~/.ssh/config", run: () => void editSshConfig() },
     { label: "Get Info", run: () => (ui.sheet = { kind: "host", host }) },
-    { label: "Copy SSH Command", run: () => void navigator.clipboard?.writeText(`ssh ${alias}`).catch(() => {}) },
+    { label: "Forget Saved Password", disabled: !host.hasSavedSecret, run: () => void forgetPassword(alias) },
     "separator",
-    { label: "Reload ~/.ssh/config", run: () => void hosts.reload().catch((err) => toasts.error(err, "Couldn't read ~/.ssh/config")) },
+    { label: "Copy Address", run: () => void copyText(hostAddress(host)) },
+    { label: "Copy SSH Command", run: () => void copyText(sshCommand(host)) },
+    ...(app ? ["separator" as const, { label: "Remove Server…", danger: true, run: () => void removeServer(alias) }] : []),
   ];
   ui.openMenu(e, items);
+}
+
+// ---- servers ----
+
+export async function connectHost(alias: string) {
+  try {
+    await hosts.connect(alias);
+  } catch (e) {
+    toasts.error(e, `Couldn't connect to “${alias}”`, { label: "Retry", run: () => void connectHost(alias) });
+  }
+}
+
+/** "user@host" plus ":port" when it isn't 22. */
+export function hostAddress(h: HostInfo): string {
+  return `${h.user ? `${h.user}@` : ""}${h.hostname}${h.port !== 22 ? `:${h.port}` : ""}`;
+}
+
+function sshCommand(h: HostInfo): string {
+  // Config hosts resolve by alias; app hosts need the full target.
+  if (h.origin === "sshConfig") return `ssh ${h.alias}`;
+  const key = h.identityFiles[0] ? ` -i ${h.identityFiles[0]}` : "";
+  return `ssh${h.port !== 22 ? ` -p ${h.port}` : ""}${key} ${h.user ? `${h.user}@` : ""}${h.hostname}`;
+}
+
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    toasts.info("Couldn't access the system clipboard");
+  }
+}
+
+export function addServer() {
+  ui.sheet = { kind: "hostEdit", host: null };
+}
+
+export function editServer(alias: string) {
+  const host = hosts.get(alias);
+  if (host?.origin === "app") ui.sheet = { kind: "hostEdit", host };
+}
+
+/** Config hosts are edited in the user's own editor. */
+export async function editSshConfig() {
+  try {
+    await api.openExternal({ source: local, path: await api.sshConfigPath() });
+  } catch (e) {
+    toasts.error(e, "Couldn't open ~/.ssh/config");
+  }
+}
+
+export async function forgetPassword(alias: string) {
+  try {
+    await api.forgetPassword(alias);
+    await hosts.reload().catch(() => {});
+    toasts.info(`Forgot the saved password for “${alias}”`, "You'll be asked for it on the next connection.");
+  } catch (e) {
+    toasts.error(e, "Couldn't remove the saved password");
+  }
+}
+
+export async function removeServer(alias: string) {
+  const ok = await ui.confirm({
+    title: `Remove “${alias}”?`,
+    message: "The server and its saved password are removed from VPS Files. Nothing on the server is changed.",
+    confirm: "Remove",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api.removeHost(alias);
+  } catch (e) {
+    toasts.error(e, `Couldn't remove “${alias}”`);
+    return;
+  }
+  for (const t of tabs.list) {
+    if (t.location?.source.kind === "ssh" && t.location.source.host === alias) openStart(t);
+    t.backStack = t.backStack.filter((s) => !(s?.source.kind === "ssh" && s.source.host === alias));
+    t.forwardStack = t.forwardStack.filter((s) => !(s?.source.kind === "ssh" && s.source.host === alias));
+  }
+  await hosts.reload().catch(() => {});
 }
 
 export async function disconnectHost(b: Browser, alias: string) {
@@ -396,8 +552,8 @@ export async function disconnectHost(b: Browser, alias: string) {
     return;
   }
   if (b.location?.source.kind === "ssh" && b.location.source.host === alias) {
-    // Leave the server like Finder ejecting a volume: fall back to local home.
-    await openLocalHome(b);
+    // Leave the server like Finder ejecting a volume.
+    openStart(b);
   }
 }
 

@@ -10,6 +10,8 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-is-maximized",
     "core:window:allow-close",
-    "opener:default"
+    "core:webview:allow-set-webview-zoom",
+    "opener:default",
+    "dialog:allow-open"
   ]
 }

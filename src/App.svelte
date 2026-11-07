@@ -11,11 +11,14 @@
   import Sheets from "$lib/components/Sheets.svelte";
   import Toasts from "$lib/components/Toasts.svelte";
   import DragGhost from "$lib/components/DragGhost.svelte";
-  import { dropItems, openLocalHome } from "$lib/actions";
+  import { dropItems, openStart } from "$lib/actions";
   import { dnd } from "$lib/stores/dnd.svelte";
   import { handleKeydown, handleMouseNav } from "$lib/keyboard";
   import { listenForFileDrops } from "$lib/osDrop";
+  import { edits } from "$lib/stores/edits.svelte";
   import { hosts } from "$lib/stores/hosts.svelte";
+  import { initThumbs } from "$lib/thumbs.svelte";
+  import { prefs } from "$lib/stores/prefs.svelte";
   import { prompts } from "$lib/stores/prompts.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
   import { toasts } from "$lib/stores/toasts.svelte";
@@ -28,10 +31,14 @@
 
   onMount(() => {
     // Subscribe before the first listing so no early event is missed.
-    Promise.all([prompts.init(), hosts.init(), transfers.init()]).catch((e) =>
-      toasts.error(e, "Couldn't reach the backend"),
-    );
-    void openLocalHome(tabs.current);
+    void initThumbs();
+    Promise.all([prompts.init(), hosts.init(), transfers.init(), edits.init()])
+      .then(() => {
+        // ?open=…&view=…&select=… for screenshot runs (src/lib/devhooks.ts).
+        if (import.meta.env.DEV) void import("$lib/devhooks").then((m) => m.runDevHooks());
+      })
+      .catch((e) => toasts.error(e, "Couldn't reach the backend"));
+    openStart(tabs.current);
     const offFileDrops = listenForFileDrops();
 
     const offSettled = transfers.onSettled((job) => {
@@ -96,7 +103,7 @@
     <Sidebar />
     <Content />
   </div>
-  <PathBar />
+  {#if prefs.pathBar}<PathBar />{/if}
 </div>
 
 {#if ui.menu}<ContextMenu />{/if}

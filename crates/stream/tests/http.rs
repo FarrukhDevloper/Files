@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vpsfiles_stream::MediaServer;
+use vpsfiles_stream::{MediaOptions, MediaServer};
 use vpsfiles_vfs::local::{from_native, LocalBackend};
 use vpsfiles_vfs::{Backend, BackendResolver, Location, Result, SourceId, VfsError};
 
@@ -168,4 +168,132 @@ async fn root_url_shape() {
     let (_d, _root, server, _data) = setup().await;
     let url = server.url_for(&Location::new(SourceId::ssh("tanla"), "/"));
     assert!(url.ends_with("/ssh%3Atanla/"), "{url}");
+}
+
+// ---- thumbnails -----------------------------------------------------------
+
+/// JavaScript's encodeURIComponent, as src/lib/ipc/media.ts uses it.
+fn encode_uri_component(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The URL `thumbUrl()` in media.ts builds.
+fn thumb_url(server: &MediaServer, loc: &Location, size: u32) -> String {
+    let segs: Vec<String> = loc.path.split('/').filter(|s| !s.is_empty()).map(encode_uri_component).collect();
+    let source = encode_uri_component(&loc.source.to_string());
+    format!("{}/thumb/{size}/{source}/{}?v=1700000000000", server.base_url(), segs.join("/"))
+}
+
+fn image_file(path: &std::path::Path, img: image::DynamicImage) {
+    img.save(path).unwrap();
+}
+
+fn dims(body: &[u8]) -> (u32, u32) {
+    let img = image::load_from_memory(body).unwrap();
+    (img.width(), img.height())
+}
+
+async fn thumb_server(ffmpeg: Option<std::path::PathBuf>) -> (tempfile::TempDir, MediaServer) {
+    let cache = tempfile::tempdir().unwrap();
+    let options = MediaOptions { thumb_cache: Some(cache.path().join("thumbs")), ffmpeg };
+    let server = MediaServer::start_with(Arc::new(LocalOnly(Arc::new(LocalBackend::new()))), options).await.unwrap();
+    (cache, server)
+}
+
+#[tokio::test]
+async fn image_thumbnails() {
+    use image::{DynamicImage, Rgb, RgbImage, Rgba, RgbaImage};
+    let dir = tempfile::tempdir().unwrap();
+    let root = from_native(dir.path());
+    let p = |name: &str| dir.path().join(name);
+    image_file(&p("photo (1)!'*.jpg"), DynamicImage::ImageRgb8(RgbImage::from_pixel(800, 400, Rgb([9, 99, 199]))));
+    image_file(&p("logo.png"), DynamicImage::ImageRgba8(RgbaImage::from_pixel(300, 300, Rgba([0, 0, 0, 0]))));
+    std::fs::write(p("notes.txt"), "hi").unwrap();
+    std::fs::write(p("broken.png"), "not a png").unwrap();
+    std::fs::File::create(p("huge.jpg")).unwrap().set_len(101 << 20).unwrap(); // sparse
+    let (cache, server) = thumb_server(None).await;
+    let thumbs = cache.path().join("thumbs");
+    let cached = || std::fs::read_dir(&thumbs).map(|d| d.count()).unwrap_or(0);
+
+    let base = server.base_url();
+    assert!(base.starts_with(&format!("http://127.0.0.1:{}/", server.port())) && !base.ends_with('/'), "{base}");
+    assert!(server.url_for(&loc(&root, "logo.png")).starts_with(&format!("{base}/local/")));
+
+    let photo = thumb_url(&server, &loc(&root, "photo (1)!'*.jpg"), 128);
+    assert!(photo.contains("photo%20(1)!'*.jpg?v="), "{photo}");
+    let r = request(&photo, "GET", &[]).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("content-type"), Some("image/jpeg"));
+    assert_eq!(r.header("cache-control"), Some("max-age=31536000, immutable"));
+    assert_eq!(dims(&r.body), (128, 64));
+    assert_eq!(cached(), 1);
+
+    let r = request(&photo, "HEAD", &[]).await;
+    assert_eq!((r.status, r.body.len()), (200, 0));
+    assert!(r.header("content-length").unwrap().parse::<usize>().unwrap() > 0);
+    assert_eq!(cached(), 1, "served from the cache");
+
+    let r = request(&thumb_url(&server, &loc(&root, "logo.png"), 9999), "GET", &[]).await;
+    assert_eq!((r.status, r.header("content-type")), (200, Some("image/png")));
+    assert_eq!(dims(&r.body), (300, 300), "clamped to 512, never enlarged");
+
+    // The cache really is what gets served: swap a cached file's content.
+    for e in std::fs::read_dir(&thumbs).unwrap() {
+        std::fs::write(e.unwrap().path(), std::fs::read(p("logo.png")).unwrap()).unwrap();
+    }
+    assert_eq!(request(&photo, "GET", &[]).await.header("content-type"), Some("image/png"));
+
+    // A changed file (other mtime/size) gets a fresh thumbnail.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    image_file(&p("photo (1)!'*.jpg"), DynamicImage::ImageRgb8(RgbImage::new(100, 400)));
+    let r = request(&photo, "GET", &[]).await;
+    assert_eq!((r.header("content-type"), dims(&r.body)), (Some("image/jpeg"), (32, 128)));
+
+    // No thumbnail for these: a 404 the webview may cache.
+    for name in ["notes.txt", "broken.png", "huge.jpg"] {
+        let r = request(&thumb_url(&server, &loc(&root, name), 64), "GET", &[]).await;
+        assert_eq!((r.status, r.header("cache-control")), (404, Some("max-age=86400")), "{name}");
+    }
+    // Errors are not cached.
+    let r = request(&thumb_url(&server, &loc(&root, "missing.jpg"), 64), "GET", &[]).await;
+    assert_eq!((r.status, r.header("cache-control")), (404, None));
+    let r = request(&thumb_url(&server, &Location::new(SourceId::ssh("down"), "/a.jpg"), 64), "GET", &[]).await;
+    assert_eq!(r.status, 502);
+}
+
+#[tokio::test]
+async fn video_thumbnails() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = from_native(dir.path());
+    let video = loc(&root, "clip one.mp4");
+
+    // Without ffmpeg: no thumbnail, quickly.
+    std::fs::write(dir.path().join("clip one.mp4"), b"whatever").unwrap();
+    let (_c, server) = thumb_server(None).await;
+    assert_eq!(request(&thumb_url(&server, &video, 64), "GET", &[]).await.status, 404);
+
+    let Some(ffmpeg) = MediaOptions::default().ffmpeg else {
+        eprintln!("ffmpeg not installed: skipping the real video part");
+        return;
+    };
+    let made = std::process::Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=duration=3:size=320x240:rate=10"])
+        .args(["-pix_fmt", "yuv420p"])
+        .arg(dir.path().join("clip one.mp4"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let (_c, server) = thumb_server(Some(ffmpeg)).await;
+    let r = request(&thumb_url(&server, &video, 64), "GET", &[]).await;
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(r.header("content-type"), Some("image/jpeg"));
+    assert_eq!(dims(&r.body), (64, 48));
 }

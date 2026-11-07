@@ -2,6 +2,7 @@
   import X from "@lucide/svelte/icons/x";
   import Plus from "@lucide/svelte/icons/plus";
   import Server from "@lucide/svelte/icons/server";
+  import { newTab } from "$lib/actions";
   import { dnd, dropKey } from "$lib/stores/dnd.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
   import { sourceKey } from "$lib/util/path";
@@ -46,7 +47,7 @@
       </span>
     </div>
   {/each}
-  <button class="add" aria-label="New tab" title="New Tab ({shortcutLabel('Mod+T')})" onclick={() => tabs.open()}>
+  <button class="add" aria-label="New tab" title="New Tab ({shortcutLabel('Mod+T')})" onclick={() => newTab()}>
     <Plus size={14} strokeWidth={2} />
   </button>
 </div>
@@ -55,7 +56,7 @@
   .tabbar {
     flex: none;
     display: flex;
-    height: 28px;
+    height: 32px;
     background: var(--bg-sidebar);
     border-bottom: 1px solid var(--border);
   }
@@ -68,7 +69,7 @@
     justify-content: center;
     padding: 0 26px;
     color: var(--fg-secondary);
-    font-size: 12px;
+    font-size: var(--fs-secondary);
   }
   .tab + .tab { border-left: 1px solid var(--border); }
   .tab:hover:not(.active) { background: var(--bg-hover); }

@@ -2,38 +2,35 @@
   import KeyRound from "@lucide/svelte/icons/key-round";
   import Lock from "@lucide/svelte/icons/lock";
   import TriangleExclamation from "@lucide/svelte/icons/triangle-exclamation-point";
-  import FolderOpen from "@lucide/svelte/icons/folder-open";
   import Server from "@lucide/svelte/icons/server";
   import Sheet from "./Sheet.svelte";
   import FileIcon from "./FileIcon.svelte";
-  import { goToPath } from "$lib/actions";
-  import { prefs, type SidebarSections } from "$lib/stores/prefs.svelte";
+  import PrefsSheet from "./PrefsSheet.svelte";
+  import HostEditSheet from "./HostEditSheet.svelte";
   import { prompts } from "$lib/stores/prompts.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
   import type { Entry } from "$lib/ipc/types";
   import { ui, type ConflictAction } from "$lib/stores/ui.svelte";
   import { formatDate, formatDateLong, formatMode, formatSize } from "$lib/util/format";
   import { iconFor, kindLabel } from "$lib/util/filetype";
-  import { parentPath, sourceLabel } from "$lib/util/path";
+  import { baseName, parentPath, sourceLabel } from "$lib/util/path";
+  import { edits } from "$lib/stores/edits.svelte";
 
   let secret = $state("");
-  let gotoValue = $state("");
-  let busy = $state(false);
+  /** Save the password/passphrase in the OS keychain. */
+  let remember = $state(true);
 
   // Reset per-sheet fields whenever a new one opens.
   $effect(() => {
     void prompts.current;
     secret = "";
-  });
-  $effect(() => {
-    const s = ui.sheet;
-    if (s?.kind === "goto") gotoValue = s.location.path;
+    remember = true;
   });
 
   function answer(accept: boolean) {
     const p = prompts.current;
     if (!p) return;
-    void prompts.respond(accept, p.kind === "hostKey" ? null : secret);
+    void prompts.respond(accept, p.kind === "hostKey" ? null : secret, p.kind !== "hostKey" && remember);
     secret = "";
   }
 
@@ -46,15 +43,6 @@
 
   let applyAll = $state(false);
 
-  function setHidden(show: boolean) {
-    prefs.showHidden = show;
-    for (const t of tabs.list) t.setHidden(show);
-  }
-
-  function section(key: keyof SidebarSections, on: boolean) {
-    prefs.sections = { ...prefs.sections, [key]: on };
-  }
-
   function conflict(action: ConflictAction) {
     const s = ui.sheet;
     if (s?.kind !== "conflict") return;
@@ -64,20 +52,18 @@
     s.resolve({ action, all });
   }
 
+  function resolveEdit(action: "upload" | "discard") {
+    const s = ui.sheet;
+    if (s?.kind !== "editConflict") return;
+    ui.sheet = null;
+    void edits.resolve(s.session.id, action);
+  }
+
   function describe(e: Entry): string {
     const what = e.kind === "dir" ? "Folder" : formatSize(e.size);
     return `${what}, modified ${formatDate(e.modified)}`;
   }
 
-  async function submitGoto(e: SubmitEvent) {
-    e.preventDefault();
-    const s = ui.sheet;
-    if (s?.kind !== "goto" || busy) return;
-    busy = true;
-    const ok = await goToPath(tabs.current, s.location.source, gotoValue);
-    busy = false;
-    if (ok && ui.sheet === s) ui.sheet = null;
-  }
 </script>
 
 {#if prompts.current}
@@ -97,10 +83,12 @@
         {:else if p.kind === "password"}
           <h2>Enter the password for “{p.user}@{p.host}”.</h2>
           <input class="field" type="password" bind:value={secret} autocomplete="off" aria-label="Password" />
+          <label class="check"><input type="checkbox" bind:checked={remember} /> Remember in keychain</label>
         {:else}
           <h2>Enter the passphrase for the key used by “{p.host}”.</h2>
           <p class="selectable path">{p.keyPath}</p>
           <input class="field" type="password" bind:value={secret} autocomplete="off" aria-label="Passphrase" />
+          <label class="check"><input type="checkbox" bind:checked={remember} /> Remember in keychain</label>
         {/if}
         <div class="buttons">
           <button type="button" class="btn" onclick={() => answer(false)}>Cancel</button>
@@ -161,57 +149,29 @@
     </form>
   </Sheet>
   {/key}
-{:else if ui.sheet?.kind === "prefs"}
-  <Sheet label="Preferences" oncancel={() => (ui.sheet = null)} width={440}>
-    <form class="prefs" onsubmit={(e) => { e.preventDefault(); ui.sheet = null; }}>
-      <h2>Preferences</h2>
-      <fieldset>
-        <legend>Appearance</legend>
-        <div class="seg" role="radiogroup" aria-label="Appearance">
-          {#each [["system", "System"], ["light", "Light"], ["dark", "Dark"]] as const as [value, label]}
-            <label class:on={prefs.theme === value}>
-              <input type="radio" name="theme" {value} bind:group={prefs.theme} />{label}
-            </label>
-          {/each}
-        </div>
-      </fieldset>
-      <fieldset>
-        <legend>New tabs open in</legend>
-        <select class="field" bind:value={prefs.view} aria-label="Default view">
-          <option value="icons">Icon view</option>
-          <option value="list">List view</option>
-          <option value="columns">Column view</option>
-        </select>
-      </fieldset>
-      <fieldset>
-        <legend>Files</legend>
-        <label class="check"><input type="checkbox" checked={prefs.showHidden} onchange={(e) => setHidden(e.currentTarget.checked)} /> Show hidden files</label>
-        <label class="check"><input type="checkbox" bind:checked={prefs.confirmDelete} /> Ask before deleting permanently</label>
-      </fieldset>
-      <fieldset>
-        <legend>Sidebar shows</legend>
-        <label class="check"><input type="checkbox" checked={prefs.sections.favourites} onchange={(e) => section("favourites", e.currentTarget.checked)} /> Favourites</label>
-        <label class="check"><input type="checkbox" checked={prefs.sections.locations} onchange={(e) => section("locations", e.currentTarget.checked)} /> Locations</label>
-        <label class="check"><input type="checkbox" checked={prefs.sections.servers} onchange={(e) => section("servers", e.currentTarget.checked)} /> Servers</label>
-      </fieldset>
-      <div class="buttons"><button type="submit" class="btn primary" data-default>Done</button></div>
-    </form>
-  </Sheet>
-{:else if ui.sheet?.kind === "goto"}
+{:else if ui.sheet?.kind === "hostEdit"}
   {@const s = ui.sheet}
-  <Sheet label="Go to folder" oncancel={() => (ui.sheet = null)} width={460}>
-    <form class="body" onsubmit={submitGoto}>
-      <div class="glyph"><FolderOpen size={30} strokeWidth={1.6} /></div>
+  {#key s}<HostEditSheet host={s.host} />{/key}
+{:else if ui.sheet?.kind === "editConflict"}
+  {@const s = ui.sheet.session}
+  <Sheet label="Sync conflict" oncancel={() => (ui.sheet = null)} width={480}>
+    <form class="body" onsubmit={(e) => { e.preventDefault(); resolveEdit("upload"); }}>
+      <div class="glyph warn"><TriangleExclamation size={30} strokeWidth={1.6} /></div>
       <div class="text">
-        <h2>Go to the folder on {sourceLabel(s.location.source)}:</h2>
-        <input class="field mono" bind:value={gotoValue} spellcheck="false" autocomplete="off" aria-label="Path" placeholder="/path or ~/path" />
+        <h2>“{baseName(s.location.path)}” changed on {sourceLabel(s.location.source)} while you were editing it.</h2>
+        <p>Upload your copy to replace the server's version, or discard your changes and reload the server's version in the app.</p>
+        <p class="note selectable mono">{s.location.path}</p>
         <div class="buttons">
-          <button type="button" class="btn" onclick={() => (ui.sheet = null)}>Cancel</button>
-          <button type="submit" class="btn primary" disabled={busy || !gotoValue.trim()}>Go</button>
+          <button type="button" class="btn" onclick={() => (ui.sheet = null)}>Decide Later</button>
+          <span class="grow"></span>
+          <button type="button" class="btn" onclick={() => resolveEdit("discard")}>Discard Mine</button>
+          <button type="submit" class="btn primary" data-default>Upload Mine</button>
         </div>
       </div>
     </form>
   </Sheet>
+{:else if ui.sheet?.kind === "prefs"}
+  <PrefsSheet />
 {:else if ui.sheet?.kind === "info"}
   {@const { entry, location } = ui.sheet}
   <Sheet label="Info" oncancel={() => (ui.sheet = null)} width={400}>
@@ -251,6 +211,7 @@
         <dt>Identity</dt><dd class="selectable mono">{h.identityFiles.length ? h.identityFiles.join("\n") : "ssh-agent / defaults"}</dd>
         {#if h.proxyJump}<dt>ProxyJump</dt><dd class="selectable mono">{h.proxyJump}</dd>{/if}
         <dt>Agent fwd</dt><dd>{h.forwardAgent ? "Yes" : "No"}</dd>
+        <dt>Defined in</dt><dd>{h.origin === "app" ? "VPS Files" : "~/.ssh/config"}</dd>
         {#if h.status.state === "failed"}<dt>Error</dt><dd class="selectable err">{h.status.error.message}</dd>{/if}
       </dl>
       <div class="buttons"><button class="btn primary" data-default onclick={() => (ui.sheet = null)}>Done</button></div>
@@ -272,10 +233,10 @@
   }
   .glyph.warn { background: rgba(255, 159, 10, 0.16); color: #f29a0c; }
   .text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
-  h2 { margin: 0; font-size: 13px; font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
-  p { margin: 0; color: var(--fg-secondary); font-size: 12px; }
-  .note { font-size: 11px; }
-  code, .mono { font-family: var(--font-mono); font-size: 12px; }
+  h2 { margin: 0; font-size: var(--fs-ui); font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
+  p { margin: 0; color: var(--fg-secondary); font-size: var(--fs-secondary); }
+  .note { font-size: var(--fs-small); }
+  code, .mono { font-family: var(--font-mono); font-size: var(--fs-secondary); }
   code {
     padding: 6px 8px;
     border-radius: var(--r-control);
@@ -289,20 +250,11 @@
   .info-head { display: flex; align-items: center; gap: 12px; }
   .info-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
   .info-title p { display: flex; align-items: center; gap: 6px; }
-  dl { display: grid; grid-template-columns: 90px 1fr; gap: 6px 12px; margin: 0; font-size: 12px; }
+  dl { display: grid; grid-template-columns: 90px 1fr; gap: 6px 12px; margin: 0; font-size: var(--fs-secondary); }
   dt { color: var(--fg-secondary); text-align: right; }
   dd { margin: 0; overflow-wrap: anywhere; white-space: pre-line; }
   .err { color: var(--danger); }
   .compare { grid-template-columns: 64px 1fr; }
-  .prefs { display: flex; flex-direction: column; gap: 14px; }
-  fieldset { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; border: 0; }
-  legend { padding: 0; margin-bottom: 6px; font-size: var(--fs-small); font-weight: 600; color: var(--fg-secondary); }
-  .seg { display: flex; padding: 2px; border-radius: 7px; background: var(--bg-control); }
-  .seg label { flex: 1; text-align: center; padding: 3px 0; border-radius: 5px; }
-  .seg label.on { background: var(--bg-window); box-shadow: var(--shadow-control); font-weight: 550; }
-  .seg label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
-  .seg input { position: absolute; opacity: 0; width: 0; height: 0; }
-  select.field { align-self: flex-start; min-width: 180px; }
-  .check { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .check { display: flex; align-items: center; gap: 6px; font-size: var(--fs-secondary); }
   .grow { flex: 1; }
 </style>

@@ -27,7 +27,8 @@ crates/
   vfs/                Backend trait, Entry/Location/SourceId, VfsError, path rules, LocalBackend
   ssh/                ~/.ssh/config, SshManager (connections, status, exec), SftpBackend
   transfer/           TransferManager: queue, copy/move any→any, progress, pause/cancel
-  stream/             MediaServer: HTTP Range streaming of any VFS file
+  stream/             MediaServer: HTTP Range streaming of any VFS file + thumbnails
+  edit/               open remote files in local apps, sync saves back
 src-tauri/            Tauri shell: AppState, commands, event forwarding, UI prompter
 src/                  Svelte UI
   lib/ipc/            types.ts (contract), api.ts (typed invoke), mock.ts (browser backend)
@@ -111,6 +112,18 @@ requests via `open_read(offset)` + length limit, so `<video>` can seek a
 multi-GB remote file instantly. The webview plays what it supports
 (mp4/H.264, webm, mp3, flac, ogg, images); others get an "open in mpv/VLC"
 fallback with the same URL.
+
+## Opening remote files in local apps (`crates/edit`)
+
+`open_external` on a remote file downloads it to
+`<cache>/vps-files/edit/<hash>/<original name>` (the name is kept so the OS
+picks the right app), opens it with the default app and watches its folder
+(`notify`). Each save is uploaded after a 700 ms debounce, **in place**
+(truncate + write) so the server file keeps its permissions and owner. If
+the server copy changed since the last sync, nothing is written and the
+session goes to `conflict` until the user picks upload or discard. Media
+can instead be streamed to an external player (mpv, VLC, …) found on PATH
+or in the default Windows install folders.
 
 ## Lightness rules
 

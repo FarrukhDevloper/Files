@@ -11,7 +11,8 @@ use std::time::Duration;
 use russh::keys::ssh_key::LineEnding;
 use support::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vpsfiles_ssh::{ConnStatus, SshManager};
+use serde_json::json;
+use vpsfiles_ssh::{ConnStatus, HostDraft, HostOrigin, SshManager, SshOptions};
 use vpsfiles_vfs::{path, EntryKind, VfsError, WriteMode};
 
 /// ed25519, passphrase "hunter2" (throwaway, generated for this test).
@@ -158,6 +159,100 @@ async fn key_file_auth_with_and_without_passphrase() {
     assert_eq!(p.asked(), (0, 1, 3));
 }
 
+// ---- keychain -------------------------------------------------------------
+
+#[tokio::test]
+async fn remembered_password_is_used_and_replaced_when_wrong() {
+    let (_server, home, _p, _mgr) = connected().await;
+    let saved = |m: &SshManager| m.hosts().unwrap()[0].has_saved_secret;
+    let p = Arc::new(TestPrompter { password: Some(PASSWORD.into()), remember: true, ..TestPrompter::trusting() });
+    let mgr = home.manager(p.clone());
+    assert!(!saved(&mgr));
+    mgr.backend("test").await.unwrap();
+    assert_eq!(p.asked(), (1, 1, 0));
+    assert_eq!(home.secrets.item("test"), Some(json!({ "password": PASSWORD })));
+    assert!(saved(&mgr));
+    let json = serde_json::to_value(mgr.hosts().unwrap()).unwrap();
+    assert_eq!(json[0]["hasSavedSecret"], true);
+
+    // Next start: nothing to ask.
+    let p = Arc::new(TestPrompter::default());
+    home.manager(p.clone()).backend("test").await.unwrap();
+    assert_eq!(p.asked(), (0, 0, 0));
+
+    // A stale saved password is forgotten and the user asked; without
+    // "remember" the new one isn't saved.
+    home.secrets.put("test", json!({ "password": "old" }));
+    let p = Arc::new(TestPrompter { password: Some(PASSWORD.into()), ..Default::default() });
+    home.manager(p.clone()).backend("test").await.unwrap();
+    assert_eq!(p.asked(), (0, 1, 0));
+    assert_eq!(home.secrets.item("test"), None);
+    assert!(!saved(&mgr));
+
+    // Listing reads only the index. If the keychain lost the item behind
+    // our back, the next connect corrects the index.
+    home.secrets.put("test", json!({ "password": PASSWORD }));
+    mgr.disconnect("test").await;
+    mgr.backend("test").await.unwrap();
+    mgr.disconnect("test").await;
+    assert!(saved(&mgr));
+    home.secrets.items.lock().unwrap().clear();
+    let calls = home.secrets.calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(saved(&mgr), "stale until the keychain is read");
+    assert_eq!(home.secrets.calls.load(std::sync::atomic::Ordering::SeqCst), calls, "listing never opens it");
+    let no_password = home.manager(Arc::new(TestPrompter::default()));
+    assert_eq!(code(no_password.backend("test").await), "cancelled");
+    assert!(!saved(&mgr));
+}
+
+#[tokio::test]
+async fn remembered_passphrase_skips_the_prompt() {
+    let server = TestServer::start(key(1)).await;
+    let home = Home::new();
+    let enc = home.write("enc_key", ENCRYPTED_KEY);
+    let enc_pub = russh::keys::ssh_key::PrivateKey::from_openssh(ENCRYPTED_KEY).unwrap().public_key().clone();
+    server.authorize(&enc_pub);
+    home.config(server.port, &format!("  IdentityFile {}\n", enc.display()));
+    let enc = enc.display().to_string();
+
+    let p = Arc::new(TestPrompter { passphrase: Some("hunter2".into()), remember: true, ..TestPrompter::trusting() });
+    home.manager(p.clone()).backend("test").await.unwrap();
+    assert_eq!(p.asked(), (1, 0, 1));
+    assert_eq!(home.secrets.item("test"), Some(json!({ "passphrases": { &enc: "hunter2" } })));
+
+    let p = Arc::new(TestPrompter::default());
+    home.manager(p.clone()).backend("test").await.unwrap();
+    assert_eq!(p.asked(), (0, 0, 0));
+
+    // Wrong saved passphrase: dropped, asked, saved again (remember).
+    home.secrets.put("test", json!({ "password": "kept", "passphrases": { &enc: "nope" } }));
+    let p = Arc::new(TestPrompter { passphrase: Some("hunter2".into()), remember: true, ..Default::default() });
+    home.manager(p.clone()).backend("test").await.unwrap();
+    assert_eq!(p.asked(), (0, 0, 1));
+    assert_eq!(home.secrets.item("test"), Some(json!({ "password": "kept", "passphrases": { &enc: "hunter2" } })));
+}
+
+#[tokio::test]
+async fn broken_keychain_never_blocks_connecting() {
+    let (_server, home, _p, _mgr) = connected().await;
+    home.secrets.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+    let p = Arc::new(TestPrompter { password: Some(PASSWORD.into()), remember: true, ..TestPrompter::trusting() });
+    let mgr = home.manager(p.clone());
+    mgr.backend("test").await.unwrap();
+    assert_eq!(p.asked(), (1, 1, 0));
+
+    // Remembered for this session only.
+    mgr.disconnect("test").await;
+    mgr.backend("test").await.unwrap();
+    assert_eq!(p.asked(), (1, 1, 0));
+    let p = Arc::new(TestPrompter { password: Some(PASSWORD.into()), ..Default::default() });
+    let mgr = home.manager(p.clone());
+    mgr.backend("test").await.unwrap();
+    assert_eq!(p.asked(), (0, 1, 0));
+    assert!(home.secrets.items.lock().unwrap().is_empty());
+    assert!(!mgr.hosts().unwrap()[0].has_saved_secret, "session-only secrets aren't 'saved'");
+}
+
 /// A stream of accepted Unix connections for russh's agent server.
 fn unix_incoming(
     l: tokio::net::UnixListener,
@@ -272,16 +367,6 @@ async fn exec_collects_output_and_status() {
 }
 
 #[tokio::test]
-async fn proxy_jump_is_unsupported_without_network() {
-    let home = Home::new();
-    home.write("config", "Host j\n  HostName 192.0.2.1\n  ProxyJump bastion\n");
-    let mgr = home.manager(Arc::new(TestPrompter::default()));
-    let err = mgr.backend("j").await.err().unwrap();
-    assert_eq!(err.code(), "unsupported");
-    assert!(err.to_string().contains("ProxyJump"), "{err}");
-}
-
-#[tokio::test]
 async fn hosts_come_from_configured_file() {
     let home = Home::new();
     home.write("config", "Host a b\nHost *\n  User x\n");
@@ -289,6 +374,262 @@ async fn hosts_come_from_configured_file() {
     let hosts = mgr.hosts().unwrap();
     assert_eq!(hosts.iter().map(|h| h.alias.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     assert_eq!(hosts[0].user.as_deref(), Some("x"));
+}
+
+// ---- ProxyJump ------------------------------------------------------------
+
+/// A `Host` block pointing at a test server.
+fn block(name: &str, port: u16, extra: &str) -> String {
+    format!("Host {name}\n  HostName 127.0.0.1\n  Port {port}\n  User {USER}\n{extra}")
+}
+
+fn trusting_with_password() -> Arc<TestPrompter> {
+    Arc::new(TestPrompter { password: Some(PASSWORD.into()), ..TestPrompter::trusting() })
+}
+
+fn forwards(s: &TestServer) -> usize {
+    s.count(|c| &c.forwards)
+}
+
+#[tokio::test]
+async fn proxy_jump_through_one_host() {
+    let jump = TestServer::start(key(1)).await;
+    let target = TestServer::start(key(2)).await;
+    let home = Home::new();
+    home.write("config", &[block("jump", jump.port, ""), block("test", target.port, "  ProxyJump jump\n")].concat());
+    let p = trusting_with_password();
+    let mgr = home.manager(p.clone());
+    let mut rx = mgr.subscribe();
+
+    let fs = mgr.backend("test").await.unwrap();
+    let (_g, dir) = tmp();
+    fs.list(&dir).await.unwrap();
+    assert_eq!(mgr.exec("test", "echo hi").await.unwrap().stdout, b"hi\n");
+    // Each hop is checked and authenticated on its own.
+    assert_eq!(p.asked(), (2, 2, 0));
+    let kh = home.known_hosts();
+    for port in [jump.port, target.port] {
+        assert!(kh.contains(&format!("[127.0.0.1]:{port} ssh-ed25519")), "{kh}");
+    }
+    // The target is reached only through the jump (TOFU check + real one).
+    assert_eq!((forwards(&jump), target.count(|c| &c.connections)), (2, 2));
+    assert_eq!(next_status(&mut rx).await, ConnStatus::Connecting);
+    assert_eq!(next_status(&mut rx).await, ConnStatus::Connected);
+
+    // The jump host going away takes the target down with it.
+    jump.drop_sessions();
+    assert_eq!(next_status(&mut rx).await, ConnStatus::Disconnected);
+    assert!(target.all_closed().await);
+    mgr.backend("test").await.unwrap();
+    assert_eq!(p.asked(), (2, 4, 0), "host keys are known now");
+    assert_eq!(next_status(&mut rx).await, ConnStatus::Connecting);
+    assert_eq!(next_status(&mut rx).await, ConnStatus::Connected);
+
+    // disconnect() closes the jump connection too.
+    mgr.disconnect("test").await;
+    assert!(jump.all_closed().await && target.all_closed().await);
+}
+
+#[tokio::test]
+async fn proxy_jump_chains_inline_specs_and_nested_jumps() {
+    let a = TestServer::start(key(1)).await;
+    let b = TestServer::start(key(2)).await;
+    let c = TestServer::start(key(3)).await;
+    let home = Home::new();
+
+    // `user@host:port`, then an alias.
+    let chain = format!("  ProxyJump {USER}@127.0.0.1:{},b\n", a.port);
+    home.write("config", &[block("b", b.port, ""), block("test", c.port, &chain)].concat());
+    let p = trusting_with_password();
+    home.manager(p.clone()).backend("test").await.unwrap().home().await.unwrap();
+    assert_eq!(p.asked(), (3, 3, 0));
+    assert_eq!((a.count(|c| &c.connections), forwards(&a), forwards(&b), forwards(&c)), (2, 2, 2, 0));
+    assert_eq!(c.count(|c| &c.connections), 2);
+
+    // The first jump's own ProxyJump is followed: test → b, b → a.
+    let nested = [block("a", a.port, ""), block("b", b.port, "  ProxyJump a\n"), block("test", c.port, "  ProxyJump b\n")];
+    home.write("config", &nested.concat());
+    let p = trusting_with_password();
+    home.manager(p.clone()).backend("test").await.unwrap();
+    assert_eq!(p.asked(), (0, 3, 0));
+    assert_eq!((forwards(&a), forwards(&b)), (3, 3));
+
+    // ...but not a later one's: `ProxyJump a,b` is a → b even though b
+    // says "through a".
+    home.write("config", &[nested[0].clone(), nested[1].clone(), block("test", c.port, "  ProxyJump a,b\n")].concat());
+    let p = trusting_with_password();
+    home.manager(p.clone()).backend("test").await.unwrap();
+    assert_eq!(p.asked(), (0, 3, 0));
+    assert_eq!((a.count(|c| &c.connections), forwards(&a), forwards(&b)), (4, 4, 4));
+}
+
+#[tokio::test]
+async fn proxy_jump_failures_name_the_hop() {
+    let jump = TestServer::start(key(1)).await;
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let home = Home::new();
+    let config = [
+        block("jump", jump.port, ""),
+        block("test", dead, "  ProxyJump jump\n"),
+        block("down", dead, ""),
+        block("via-down", jump.port, "  ProxyJump down\n"),
+        "Host loop1\n  ProxyJump loop2\nHost loop2\n  ProxyJump loop1\n".into(),
+        "Host bad\n  ProxyJump tester@\nHost cmd\n  ProxyCommand nc %h %p\n".into(),
+    ];
+    home.write("config", &config.concat());
+    let mgr = home.manager(trusting_with_password());
+
+    // Nothing listens behind the jump; the jump connection is closed again.
+    let err = mgr.backend("test").await.err().unwrap();
+    assert_eq!(err.code(), "not_connected");
+    assert!(err.to_string().contains("jump can't reach 127.0.0.1:"), "{err}");
+    assert!(jump.all_closed().await);
+
+    *jump.state.allow_forwarding.lock().unwrap() = false;
+    let err = mgr.backend("test").await.err().unwrap();
+    assert_eq!(err.code(), "unsupported");
+    assert!(err.to_string().contains("jump doesn't allow forwarding"), "{err}");
+
+    let err = mgr.backend("via-down").await.err().unwrap();
+    assert_eq!(err.code(), "not_connected");
+    assert!(err.to_string().starts_with("not connected: down:"), "{err}");
+
+    // Caught before any network.
+    assert_eq!(code(mgr.backend("loop1").await), "unsupported");
+    assert_eq!(code(mgr.backend("bad").await), "invalid_name");
+    assert_eq!(code(mgr.backend("cmd").await), "unsupported");
+    assert!(jump.all_closed().await);
+}
+
+// ---- app-managed hosts ----------------------------------------------------
+
+fn draft(alias: &str, port: u16) -> HostDraft {
+    HostDraft {
+        alias: alias.into(),
+        hostname: "127.0.0.1".into(),
+        user: Some(USER.into()),
+        port,
+        identity_file: None,
+        password: None,
+    }
+}
+
+fn listed(mgr: &SshManager) -> Vec<(String, HostOrigin)> {
+    mgr.hosts().unwrap().into_iter().map(|h| (h.alias, h.origin)).collect()
+}
+
+fn owned(v: &[(&str, HostOrigin)]) -> Vec<(String, HostOrigin)> {
+    v.iter().map(|(a, o)| (a.to_string(), *o)).collect()
+}
+
+#[tokio::test]
+async fn app_hosts_are_listed_validated_and_persisted() {
+    use HostOrigin::{App, SshConfig};
+    let home = Home::new();
+    home.write("config", "Host cfg\n  HostName 192.0.2.1\n");
+    let mgr = home.manager(Arc::new(TestPrompter::default()));
+
+    let saved = mgr.save_host(draft("web", 2222), None).await.unwrap();
+    assert_eq!((saved.origin, saved.port, saved.user.as_deref()), (App, 2222, Some(USER)));
+    assert_eq!(listed(&mgr), owned(&[("cfg", SshConfig), ("web", App)]));
+    let hosts = serde_json::to_value(mgr.hosts().unwrap()).unwrap();
+    assert_eq!((&hosts[0]["origin"], &hosts[1]["origin"]), (&json!("sshConfig"), &json!("app")));
+    // Read back from hosts.json by the next start.
+    assert_eq!(listed(&home.manager(Arc::new(TestPrompter::default()))), listed(&mgr));
+
+    assert_eq!(code(mgr.save_host(draft("cfg", 22), None).await), "already_exists");
+    assert_eq!(code(mgr.save_host(draft("web", 22), None).await), "already_exists");
+    assert_eq!(code(mgr.save_host(draft("bad name", 22), None).await), "invalid_name");
+    assert_eq!(code(mgr.save_host(draft("x", 22), Some("cfg")).await), "unsupported");
+    assert_eq!(code(mgr.save_host(draft("x", 22), Some("nope")).await), "not_found");
+    assert_eq!(code(mgr.remove_host("cfg").await), "unsupported");
+    assert_eq!(code(mgr.remove_host("nope").await), "not_found");
+
+    // Rename keeps the position; renaming onto another app host conflicts.
+    mgr.save_host(draft("db", 5432), None).await.unwrap();
+    mgr.save_host(draft("web2", 2222), Some("web")).await.unwrap();
+    assert_eq!(listed(&mgr), owned(&[("cfg", SshConfig), ("web2", App), ("db", App)]));
+    assert_eq!(code(mgr.save_host(draft("db", 1), Some("web2")).await), "already_exists");
+    mgr.save_host(draft("web2", 2223), Some("web2")).await.unwrap();
+    assert_eq!(mgr.hosts().unwrap()[1].port, 2223);
+
+    mgr.remove_host("web2").await.unwrap();
+    assert_eq!(listed(&mgr), owned(&[("cfg", SshConfig), ("db", App)]));
+
+    // Every name in ~/.ssh/config is taken, even one not listed because its
+    // block sets HostName (`Host cfg cfg-ip` is one server, listed as cfg).
+    home.write("config", "Host cfg cfg-ip\n  HostName 192.0.2.1\n");
+    assert_eq!(listed(&mgr), owned(&[("cfg", SshConfig), ("db", App)]));
+    assert_eq!(code(mgr.save_host(draft("cfg-ip", 22), None).await), "already_exists");
+
+    // ~/.ssh/config defining the same alias later wins.
+    home.write("config", "Host cfg db\n");
+    assert_eq!(listed(&mgr), owned(&[("cfg", SshConfig), ("db", SshConfig)]));
+
+    // Damaged hosts.json: config hosts still listed, saving won't clobber it.
+    std::fs::write(home.path("app/hosts.json"), "{").unwrap();
+    assert_eq!(listed(&mgr).len(), 2);
+    assert_eq!(code(mgr.save_host(draft("z", 22), None).await), "other");
+    assert_eq!(std::fs::read_to_string(home.path("app/hosts.json")).unwrap(), "{");
+}
+
+#[tokio::test]
+async fn app_host_uses_its_saved_password_and_edits_disconnect() {
+    let server = TestServer::start(key(1)).await;
+    let home = Home::new(); // no ~/.ssh/config at all
+    let p = Arc::new(TestPrompter::trusting()); // has no password to give
+    let mgr = home.manager(p.clone());
+    mgr.save_host(HostDraft { password: Some(PASSWORD.into()), ..draft("web", server.port) }, None).await.unwrap();
+    assert_eq!(home.secrets.item("web"), Some(json!({ "password": PASSWORD })));
+    assert!(!std::fs::read_to_string(home.path("app/hosts.json")).unwrap().contains(PASSWORD));
+    mgr.backend("web").await.unwrap();
+    assert_eq!(p.asked(), (1, 0, 0));
+
+    // Rename: disconnected, the saved password moves along.
+    let mut rx = mgr.subscribe();
+    assert!(mgr.hosts().unwrap()[0].has_saved_secret);
+    mgr.save_host(draft("web2", server.port), Some("web")).await.unwrap();
+    let ev = rx.try_recv().unwrap();
+    assert_eq!((ev.host.as_str(), ev.status), ("web", ConnStatus::Disconnected));
+    assert_eq!((home.secrets.item("web"), home.secrets.item("web2").is_some()), (None, true));
+    let index = std::fs::read_to_string(home.path("app/secrets-index.json")).unwrap();
+    assert!(index.contains("\"web2\"") && !index.contains("\"web\"") && !index.contains(PASSWORD), "{index}");
+    assert!(mgr.hosts().unwrap()[0].has_saved_secret);
+    mgr.backend("web2").await.unwrap();
+    assert_eq!(p.asked(), (1, 0, 0));
+
+    // A different host name must not get the old password.
+    mgr.save_host(HostDraft { hostname: "localhost".into(), ..draft("web2", server.port) }, Some("web2"))
+        .await
+        .unwrap();
+    assert_eq!(mgr.status("web2"), ConnStatus::Disconnected);
+    assert_eq!(home.secrets.item("web2"), None);
+
+    // forget_password and remove_host clear the keychain item.
+    let with_pw = || HostDraft { password: Some("pw".into()), ..draft("web2", server.port) };
+    mgr.save_host(with_pw(), Some("web2")).await.unwrap();
+    mgr.forget_password("web2").await.unwrap();
+    assert_eq!(home.secrets.item("web2"), None);
+    assert!(!mgr.hosts().unwrap()[0].has_saved_secret);
+    mgr.save_host(with_pw(), Some("web2")).await.unwrap();
+    mgr.remove_host("web2").await.unwrap();
+    assert_eq!(home.secrets.item("web2"), None);
+    assert!(mgr.hosts().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn app_host_with_key_file() {
+    let server = TestServer::start(key(1)).await;
+    let home = Home::new();
+    let k = key(9);
+    let path = home.write("my_key", &k.to_openssh(LineEnding::LF).unwrap());
+    server.authorize(k.public_key());
+    let p = Arc::new(TestPrompter::trusting());
+    let mgr = home.manager(p.clone());
+    let host = mgr.save_host(HostDraft { identity_file: Some(path.clone()), ..draft("k", server.port) }, None).await;
+    assert_eq!(host.unwrap().identity_files, [path]);
+    mgr.backend("k").await.unwrap();
+    assert_eq!(p.asked(), (1, 0, 0));
 }
 
 // ---- SFTP backend ---------------------------------------------------------
@@ -445,7 +786,8 @@ async fn large_file_round_trip_and_seek() {
 // ---- real host (read-only, opt-in) ----------------------------------------
 
 /// `VPSFILES_TEST_HOST=<alias> cargo test -p vpsfiles-ssh -- --ignored`
-/// Uses the real ~/.ssh; only connects, lists home and stats it.
+/// Uses the real ~/.ssh (never the keychain or the app's hosts.json); only
+/// connects, lists home and stats it.
 #[tokio::test]
 #[ignore]
 async fn real_host_read_only() {
@@ -456,14 +798,20 @@ async fn real_host_read_only() {
         async fn confirm_host_key(&self, _: &str, _: &str, _: &str) -> bool {
             false
         }
-        async fn password(&self, _: &str, _: &str) -> Option<String> {
+        async fn password(&self, _: &str, _: &str) -> Option<vpsfiles_ssh::Secret> {
             None
         }
-        async fn passphrase(&self, _: &str, _: &str) -> Option<String> {
+        async fn passphrase(&self, _: &str, _: &str) -> Option<vpsfiles_ssh::Secret> {
             None
         }
     }
-    let mgr = SshManager::new(Arc::new(NoPrompts));
+    let scratch = tempfile::tempdir().unwrap();
+    let options = SshOptions {
+        hosts_file: scratch.path().join("hosts.json"),
+        secrets: Arc::new(MemorySecrets::default()),
+        ..SshOptions::default()
+    };
+    let mgr = SshManager::with_options(Arc::new(NoPrompts), options);
     let fs = mgr.backend(&alias).await.unwrap();
     let home = fs.home().await.unwrap();
     let entries = fs.list(&home).await.unwrap();

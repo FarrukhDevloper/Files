@@ -58,6 +58,9 @@ export type ConnStatus =
   | { state: "connected" }
   | { state: "failed"; error: VfsError };
 
+/** Where a host is defined. Only "app" hosts can be edited in the app. */
+export type HostOrigin = "sshConfig" | "app";
+
 export interface HostInfo {
   alias: string;
   hostname: string;
@@ -67,6 +70,22 @@ export interface HostInfo {
   proxyJump: string | null;
   forwardAgent: boolean;
   status: ConnStatus;
+  origin: HostOrigin;
+  /** A password or key passphrase for this host is in the OS keychain. */
+  hasSavedSecret: boolean;
+}
+
+/** Add/edit form for an app-managed server. */
+export interface HostDraft {
+  /** Unique name shown in the sidebar: letters, digits, ".", "_", "-". */
+  alias: string;
+  hostname: string;
+  user: string | null;
+  port: number;
+  /** Local path of a private key; null = ssh-agent / default keys. */
+  identityFile: string | null;
+  /** Saved to the OS keychain when non-null. */
+  password: string | null;
 }
 
 export interface ConnEvent {
@@ -116,6 +135,22 @@ export interface TextPreview {
   truncated: boolean;
 }
 
+/** Opening a remote file in a local app: a temp copy is downloaded, opened,
+ * and every save is uploaded back. */
+export type EditState =
+  | "downloading" | "open" | "uploading" | "synced" | "conflict" | "failed" | "closed";
+
+export interface EditSession {
+  id: string;
+  location: Location;
+  /** The local temp copy the OS app has open. */
+  localPath: string;
+  state: EditState;
+  error: VfsError | null;
+  /** Unix ms of the last successful upload. */
+  lastSync: number | null;
+}
+
 /** Emitted on "prompt:request"; answer with api.promptRespond. */
 export type PromptRequest =
   | { kind: "hostKey"; id: string; host: string; algorithm: string; fingerprint: string }
@@ -126,4 +161,5 @@ export interface EventMap {
   "conn:status": ConnEvent;
   "transfer:update": JobSnapshot;
   "prompt:request": PromptRequest;
+  "edit:update": EditSession;
 }

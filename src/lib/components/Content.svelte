@@ -3,6 +3,7 @@
   import ListView from "./ListView.svelte";
   import IconView from "./IconView.svelte";
   import ColumnView from "./ColumnView.svelte";
+  import HomePage from "./HomePage.svelte";
   import { dnd } from "$lib/stores/dnd.svelte";
   import { hosts } from "$lib/stores/hosts.svelte";
   import { tabs } from "$lib/stores/tabs.svelte";
@@ -29,7 +30,9 @@
      on it (src/lib/keyboard.ts). The listboxes inside carry the roles. -->
 <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
 <section class="content" tabindex="0" aria-label="Files" bind:this={section}>
-  {#if b.error}
+  {#if b.home}
+    <HomePage />
+  {:else if b.error}
     <div class="state">
       <CircleExclamation size={36} strokeWidth={1.5} />
       <h2>{errorTitle(b.error.code)}</h2>
@@ -81,8 +84,8 @@
     color: var(--fg-secondary);
     text-align: center;
   }
-  .state h2 { margin: 4px 0 0; font-size: 14px; color: var(--fg-primary); }
-  .state p { margin: 0 0 8px; max-width: 420px; white-space: pre-line; font-size: 12px; }
+  .state h2 { margin: 4px 0 0; font-size: var(--fs-title); color: var(--fg-primary); }
+  .state p { margin: 0 0 8px; max-width: 420px; white-space: pre-line; font-size: var(--fs-secondary); }
   .os-drop {
     position: absolute;
     inset: 4px;

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tauri::Emitter;
 use tokio::sync::oneshot;
-use vpsfiles_ssh::Prompter;
+use vpsfiles_ssh::{Prompter, Secret};
 
 /// An unanswered dialog is treated as "cancel" after this long.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -25,6 +25,15 @@ pub enum PromptRequest {
 pub struct Answer {
     pub accept: bool,
     pub secret: Option<String>,
+    /// "Remember in keychain" for a password / passphrase.
+    pub remember: bool,
+}
+
+impl Answer {
+    fn into_secret(self) -> Option<Secret> {
+        let value = self.secret.filter(|_| self.accept)?;
+        Some(Secret { value, remember: self.remember })
+    }
 }
 
 pub struct UiPrompter {
@@ -71,15 +80,13 @@ impl Prompter for UiPrompter {
         .is_some_and(|a| a.accept)
     }
 
-    async fn password(&self, host: &str, user: &str) -> Option<String> {
-        let a = self.ask(|id| PromptRequest::Password { id, host: host.into(), user: user.into() }).await?;
-        a.accept.then_some(a.secret).flatten()
+    async fn password(&self, host: &str, user: &str) -> Option<Secret> {
+        self.ask(|id| PromptRequest::Password { id, host: host.into(), user: user.into() }).await?.into_secret()
     }
 
-    async fn passphrase(&self, host: &str, key_path: &str) -> Option<String> {
-        let a = self
-            .ask(|id| PromptRequest::Passphrase { id, host: host.into(), key_path: key_path.into() })
-            .await?;
-        a.accept.then_some(a.secret).flatten()
+    async fn passphrase(&self, host: &str, key_path: &str) -> Option<Secret> {
+        self.ask(|id| PromptRequest::Passphrase { id, host: host.into(), key_path: key_path.into() })
+            .await?
+            .into_secret()
     }
 }

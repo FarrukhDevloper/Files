@@ -12,6 +12,8 @@ class Hosts {
   places = $state.raw<Place[]>([]);
   favourites = $derived(this.places.filter((p) => p.kind !== "root" && p.kind !== "drive"));
   locations = $derived(this.places.filter((p) => p.kind === "root" || p.kind === "drive"));
+  /** Local home folder, once places are loaded. */
+  homeFolder = $derived(this.places.find((p) => p.kind === "home")?.path ?? null);
 
   #pending = new Map<string, Promise<void>>();
   #listeners = new Set<StatusListener>();
@@ -49,6 +51,8 @@ class Hosts {
         .then(() => {
           // The backend emits conn:status too; this covers a missed event.
           if (this.status(alias).state !== "connected") this.#setStatus(alias, { state: "connected" });
+          // A password may have been saved to the keychain on the way.
+          void this.reload().catch(() => {});
         })
         .catch((e) => {
           const s = this.status(alias).state;

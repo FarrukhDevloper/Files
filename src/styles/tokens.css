@@ -6,15 +6,20 @@
   color-scheme: light;
   --font-ui: "Inter Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "JetBrains Mono", "Cascadia Code", "DejaVu Sans Mono", Menlo, Consolas, monospace;
-  --fs-ui: 13px;
-  --fs-small: 11px;
+  /* Sizes are for 100 % interface size; Preferences → Interface size zooms
+     the whole webview (src/lib/util/zoom.ts). */
+  --fs-ui: 14px;
+  --fs-secondary: 13px;
+  --fs-small: 12px;
+  --fs-title: 15px;
 
   --r-control: 6px;
   --r-popover: 10px;
-  --row-h: 24px;
-  --side-row-h: 22px;
-  --toolbar-h: 52px;
-  --pathbar-h: 26px;
+  --row-h: 28px;
+  --side-row-h: 28px;
+  --toolbar-h: 54px;
+  --pathbar-h: 28px;
+  --control-h: 28px;
 
   --accent: #0a84ff;
   --accent-hover: #0077ed;
@@ -243,9 +248,9 @@ button {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  height: 24px;
-  min-width: 72px;
-  padding: 0 12px;
+  height: var(--control-h);
+  min-width: 80px;
+  padding: 0 14px;
   border-radius: var(--r-control);
   background: var(--bg-field);
   box-shadow: 0 0 0 0.5px var(--border-strong), var(--shadow-control);
@@ -258,8 +263,8 @@ button {
 .btn:disabled { opacity: 0.5; }
 
 .field {
-  height: 24px;
-  padding: 0 8px;
+  height: var(--control-h);
+  padding: 0 9px;
   border-radius: var(--r-control);
   border: 0;
   background: var(--bg-field);
@@ -271,9 +276,9 @@ button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 28px;
-  min-width: 30px;
-  padding: 0 6px;
+  height: 32px;
+  min-width: 32px;
+  padding: 0 7px;
   border-radius: var(--r-control);
   color: var(--fg-secondary);
 }
@@ -285,8 +290,8 @@ button {
 .dot {
   display: inline-block;
   flex: none;
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: var(--dot-off);
 }
@@ -296,8 +301,8 @@ button {
 @keyframes dot-pulse { to { opacity: 0.35; } }
 
 .spinner {
-  width: 12px;
-  height: 12px;
+  width: 13px;
+  height: 13px;
   border-radius: 50%;
   border: 1.5px solid var(--fg-tertiary);
   border-top-color: transparent;

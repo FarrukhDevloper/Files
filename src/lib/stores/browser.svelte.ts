@@ -36,14 +36,20 @@ export interface GoOptions {
   select?: string | null;
 }
 
+/** A history entry: a folder, or null for the Home start page. */
+export type Stop = Location | null;
+
 export class Browser {
+  /** null while the Home start page is shown (or before the first listing). */
   location = $state.raw<Location | null>(null);
+  /** Showing the Home start page (servers, drives) instead of a folder. */
+  home = $state(false);
   entries = $state.raw<Entry[]>([]);
   loading = $state(false);
   /** Set when the current folder couldn't be listed (shown in place of the list). */
   error = $state.raw<VfsError | null>(null);
-  backStack = $state.raw<Location[]>([]);
-  forwardStack = $state.raw<Location[]>([]);
+  backStack = $state.raw<Stop[]>([]);
+  forwardStack = $state.raw<Stop[]>([]);
 
   view = $state<ViewMode>(prefs.view);
   sort = $state.raw<Sort>(prefs.sort);
@@ -80,7 +86,9 @@ export class Browser {
   });
   selection = $derived(this.items.filter((e) => this.selected.has(e.path)));
   title = $derived(
-    this.location ? (isRoot(this.location.path) ? sourceLabel(this.location.source) : baseName(this.location.path)) : "VPS Files",
+    this.home ? "Home"
+      : this.location ? (isRoot(this.location.path) ? sourceLabel(this.location.source) : baseName(this.location.path))
+      : "VPS Files",
   );
 
   #anchor: string | null = null;
@@ -92,10 +100,41 @@ export class Browser {
   get canBack() { return this.backStack.length > 0; }
   get canForward() { return this.forwardStack.length > 0; }
   get canUp() { return !!this.location && parentPath(this.location.path) !== null; }
+  /** Where we are, as a history entry; undefined before anything was shown. */
+  get #here(): Stop | undefined { return this.home ? null : this.location ?? undefined; }
+
+  /** Show the Home start page. */
+  showHome(opts: Pick<GoOptions, "history"> = {}) {
+    this.#seq++;
+    const here = this.#here;
+    if (!this.home && here !== undefined && (opts.history ?? "push") === "push") {
+      this.backStack = [...this.backStack, here].slice(-100);
+      this.forwardStack = [];
+    }
+    this.home = true;
+    this.location = null;
+    this.entries = [];
+    this.error = null;
+    this.loading = false;
+    this.filter = "";
+    this.renaming = null;
+    this.listingId++;
+    this.selectOnly(null);
+  }
+
+  /** Go to a history entry. */
+  #visit(stop: Stop): Promise<boolean> {
+    if (stop === null) {
+      this.showHome({ history: "none" });
+      return Promise.resolve(true);
+    }
+    return this.go(stop, { history: "none" });
+  }
 
   /** List `loc` and show it. Resolves false if it failed or was superseded. */
   async go(loc: Location, opts: GoOptions = {}): Promise<boolean> {
     const seq = ++this.#seq;
+    const here = this.#here;
     const from = this.location;
     const same = sameLocation(loc, from);
     this.loading = true;
@@ -103,10 +142,11 @@ export class Browser {
       const list = await this.#list(loc, seq);
       if (list === null) return false;
 
-      if (!same && from && (opts.history ?? "push") === "push") {
-        this.backStack = [...this.backStack, from].slice(-100);
+      if (!same && here !== undefined && (opts.history ?? "push") === "push") {
+        this.backStack = [...this.backStack, here].slice(-100);
         this.forwardStack = [];
       }
+      this.home = false;
       this.location = loc;
       this.entries = list;
       this.error = null;
@@ -135,7 +175,7 @@ export class Browser {
     } catch (e) {
       if (seq !== this.#seq) return false;
       const label = baseName(loc.path) || sourceLabel(loc.source);
-      if (!from) {
+      if (!from && !this.home) {
         // Nothing to stay on: show the error in place of the listing.
         this.location = loc;
         this.entries = [];
@@ -166,9 +206,9 @@ export class Browser {
 
   async back() {
     const target = this.backStack.at(-1);
-    const from = this.location;
-    if (!target || !from) return;
-    if (await this.go(target, { history: "none" })) {
+    const from = this.#here;
+    if (target === undefined || from === undefined) return;
+    if (await this.#visit(target)) {
       this.backStack = this.backStack.slice(0, -1);
       this.forwardStack = [...this.forwardStack, from];
     }
@@ -176,9 +216,9 @@ export class Browser {
 
   async forward() {
     const target = this.forwardStack.at(-1);
-    const from = this.location;
-    if (!target || !from) return;
-    if (await this.go(target, { history: "none" })) {
+    const from = this.#here;
+    if (target === undefined || from === undefined) return;
+    if (await this.#visit(target)) {
       this.forwardStack = this.forwardStack.slice(0, -1);
       this.backStack = [...this.backStack, from];
     }

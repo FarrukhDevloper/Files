@@ -1,11 +1,13 @@
 <script lang="ts">
   import FileIcon from "./FileIcon.svelte";
   import { dnd } from "$lib/stores/dnd.svelte";
+  import { cssZoom } from "$lib/util/zoom";
 
   const p = $derived(dnd.payload!);
+  const z = cssZoom();
 </script>
 
-<div class="ghost" style:transform="translate({dnd.x + 10}px, {dnd.y + 8}px)" aria-hidden="true">
+<div class="ghost" style:transform="translate({dnd.x / z + 10}px, {dnd.y / z + 8}px)" aria-hidden="true">
   <FileIcon type={p.icon} size={32} />
   <span class="label">{p.label}</span>
   {#if p.items.length > 1}<span class="count">{p.items.length}</span>{/if}
@@ -39,7 +41,7 @@
     padding: 0 5px;
     border-radius: 9px;
     color: #fff;
-    font-size: 11px;
+    font-size: var(--fs-small);
     font-weight: 700;
     line-height: 18px;
     text-align: center;

@@ -14,6 +14,10 @@ Every command rejects with `VfsError = { code, message }`.
 | `list_hosts` | — | `HostInfo[]` |
 | `connect_host` | `alias` | — (may trigger `prompt:request`) |
 | `disconnect_host` | `alias` | — |
+| `save_host` | `draft: HostDraft, previousAlias` | `HostInfo` (app hosts only) |
+| `remove_host` | `alias` | — (app hosts only) |
+| `forget_password` | `alias` | — |
+| `ssh_config_path` | — | `string` |
 | `local_places` | — | `Place[]` |
 | `home_dir` | `source: SourceId` | `string` |
 | `list_dir` | `location` | `Entry[]` (unsorted) |
@@ -23,13 +27,19 @@ Every command rejects with `VfsError = { code, message }`.
 | `rename_path` | `location, newName` | `Entry` (renamed) |
 | `delete_paths` | `locations, permanent` | — (local + !permanent → trash) |
 | `read_text` | `location, maxBytes` | `{ text, truncated }`, `unsupported` for binary |
-| `open_external` | `location` | — (local only for now) |
+| `open_external` | `location` | local: `null`; remote: `EditSession` (download → open → sync saves back) |
+| `edit_list` | — | `EditSession[]` |
+| `edit_stop` | `id` | — |
+| `edit_resolve` | `id, action: "upload"\|"discard"` | — |
 | `transfer_start` | `request: TransferRequest` | job id |
 | `transfer_list` | — | `JobSnapshot[]` |
 | `transfer_pause` / `_resume` / `_cancel` | `id` | — |
 | `transfer_clear_finished` | — | — |
 | `media_url` | `location` | `http://127.0.0.1:…` URL |
-| `prompt_respond` | `id, accept, secret` | — |
+| `media_base` | — | `http://127.0.0.1:PORT/TOKEN` (see `src/lib/ipc/media.ts`) |
+| `external_players` | — | `string[]` |
+| `open_in_player` | `location, player` | — |
+| `prompt_respond` | `id, accept, secret, remember` | — |
 
 ## Events
 
@@ -38,6 +48,7 @@ Every command rejects with `VfsError = { code, message }`.
 | `conn:status` | `{ host, status: ConnStatus }` |
 | `transfer:update` | `JobSnapshot` (on state change + ≤5×/s progress) |
 | `prompt:request` | `PromptRequest` (`hostKey` / `password` / `passphrase`) |
+| `edit:update` | `EditSession` |
 
 ## Shapes
 
@@ -49,7 +60,8 @@ Entry         = { name, path, kind: "file"|"dir"|"other", size, modified: ms|nul
 ConnStatus    = { state: "disconnected"|"connecting"|"connected" }
               | { state: "failed", error: VfsError }
 HostInfo      = { alias, hostname, user, port, identityFiles, proxyJump,
-                  forwardAgent, status: ConnStatus }
+                  forwardAgent, status: ConnStatus, origin: "sshConfig"|"app",
+                  hasSavedSecret: boolean }
 TransferRequest = { op: "copy"|"move", sources: Location[], destDir: Location,
                     conflict: "overwrite"|"merge"|"skip"|"keepBoth" }
                   // overwrite = Finder Replace (whole folder, staged swap)

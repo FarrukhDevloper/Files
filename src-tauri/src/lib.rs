@@ -2,6 +2,8 @@
 //! backend broadcasts as window events. No file logic lives here.
 
 mod commands;
+mod open;
+mod players;
 mod prompter;
 mod state;
 
@@ -13,17 +15,26 @@ use state::AppState;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             let state = AppState::new(app.handle().clone());
             forward(app.handle().clone(), "conn:status", state.ssh.subscribe());
             forward(app.handle().clone(), "transfer:update", state.transfers.subscribe());
+            forward(app.handle().clone(), "edit:update", state.edits.subscribe());
             app.manage(state);
+            #[cfg(debug_assertions)]
+            dev_query(app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_hosts,
             commands::connect_host,
             commands::disconnect_host,
+            commands::save_host,
+            commands::remove_host,
+            commands::forget_password,
+            commands::ssh_config_path,
             commands::local_places,
             commands::home_dir,
             commands::list_dir,
@@ -33,7 +44,13 @@ pub fn run() {
             commands::rename_path,
             commands::delete_paths,
             commands::read_text,
-            commands::open_external,
+            open::open_external,
+            open::edit_list,
+            open::edit_stop,
+            open::edit_resolve,
+            open::media_base,
+            open::external_players,
+            open::open_in_player,
             commands::transfer_start,
             commands::transfer_list,
             commands::transfer_pause,
@@ -64,4 +81,17 @@ where
             }
         }
     });
+}
+
+/// Debug builds only: `VPSFILES_DEV_QUERY="open=local:/tmp&view=icons"` reloads
+/// the window with that query so the UI's dev hooks (src/lib/devhooks.ts) can
+/// put it in a given state — used for headless screenshot checks.
+#[cfg(debug_assertions)]
+fn dev_query(app: &tauri::App) {
+    let Ok(query) = std::env::var("VPSFILES_DEV_QUERY") else { return };
+    let Some(window) = app.get_webview_window("main") else { return };
+    if let Ok(mut url) = window.url() {
+        url.set_query(Some(&query));
+        let _ = window.navigate(url);
+    }
 }

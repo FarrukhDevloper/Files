@@ -7,7 +7,7 @@
   import Column from "./Column.svelte";
   import FileIcon from "./FileIcon.svelte";
   import Thumb from "./Thumb.svelte";
-  import { wantsThumbnail } from "$lib/thumbs";
+  import { wantsThumbnail } from "$lib/thumbs.svelte";
   import { itemPointer } from "./itemPointer";
   import { backgroundMenu, commitRename, entryMenu, openEntry } from "$lib/actions";
   import { api } from "$lib/ipc/api";
@@ -150,6 +150,7 @@
         <Column
           entries={col.entries}
           {srcKey}
+          source={b.location?.source ?? null}
           active={false}
           isSelected={(p) => p === col.child}
           reveal={col.child}
@@ -171,6 +172,7 @@
     <Column
       entries={b.items}
       {srcKey}
+      source={b.location?.source ?? null}
       active={ui.windowFocused}
       isSelected={(p) => b.selected.has(p)}
       isCut={(p) => clipboard.cutKeys.has(cutPrefix + p)}
@@ -195,6 +197,7 @@
           <Column
             entries={previewEntries}
             {srcKey}
+            source={b.location?.source ?? null}
             active={false}
             isSelected={() => false}
             onrowdown={otherDown(dirPath)}
@@ -211,9 +214,9 @@
   {:else if single}
     <div class="col info">
       {#if b.location && wantsThumbnail(single, b.location)}
-        {#key single.path}<Thumb entry={single} location={b.locationOf(single)} size={128} />{/key}
+        {#key single.path}<Thumb entry={single} location={b.locationOf(single)} size={160} />{/key}
       {:else}
-        <FileIcon type={iconFor(single)} size={96} link={single.isSymlink} />
+        <FileIcon type={iconFor(single)} size={112} link={single.isSymlink} />
       {/if}
       <h3 class="selectable">{single.name}</h3>
       <dl>
@@ -235,14 +238,14 @@
   }
   .col {
     flex: none;
-    width: 230px;
+    width: 250px;
     height: 100%;
     border-right: 1px solid var(--separator);
   }
   .loading { height: 100%; display: grid; place-items: center; }
-  .note { margin: 14px; color: var(--fg-tertiary); font-size: 12px; text-align: center; }
+  .note { margin: 14px; color: var(--fg-tertiary); font-size: var(--fs-secondary); text-align: center; }
   .info {
-    width: 260px;
+    width: 280px;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -250,8 +253,8 @@
     gap: 6px;
     overflow-y: auto;
   }
-  .info h3 { margin: 8px 0 4px; font-size: 13px; text-align: center; overflow-wrap: anywhere; }
-  dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; font-size: 12px; }
+  .info h3 { margin: 8px 0 4px; font-size: var(--fs-ui); text-align: center; overflow-wrap: anywhere; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; font-size: var(--fs-secondary); }
   dt { color: var(--fg-secondary); text-align: right; }
   dd { margin: 0; }
   .hint { margin-top: 10px; color: var(--fg-tertiary); font-size: var(--fs-small); }

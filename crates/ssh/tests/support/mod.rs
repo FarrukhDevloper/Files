@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,7 +21,8 @@ use russh_sftp::extensions::Statvfs;
 use russh_sftp::protocol::{
     Attrs, Data, ExtendedReply, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version,
 };
-use vpsfiles_ssh::{Prompter, SshManager, SshOptions};
+use vpsfiles_ssh::{Prompter, Secret, SecretStore, SshManager, SshOptions};
+use vpsfiles_vfs::VfsError;
 
 pub const USER: &str = "tester";
 pub const PASSWORD: &str = "s3cret";
@@ -33,6 +34,10 @@ pub fn key(seed: u8) -> PrivateKey {
 #[derive(Default)]
 pub struct Counters {
     pub connections: AtomicUsize,
+    /// SSH sessions that ended (the client went away).
+    pub closed: AtomicUsize,
+    /// direct-tcpip channels asked for (we are someone's ProxyJump).
+    pub forwards: AtomicUsize,
     pub stats: AtomicUsize,
     pub readdirs: AtomicUsize,
     pub execs: AtomicUsize,
@@ -42,6 +47,7 @@ pub struct ServerState {
     pub config: Mutex<Arc<russh::server::Config>>,
     pub authorized: Mutex<Vec<PublicKey>>,
     pub allow_exec: Mutex<bool>,
+    pub allow_forwarding: Mutex<bool>,
     pub counters: Counters,
     sessions: Mutex<Vec<tokio::task::AbortHandle>>,
 }
@@ -68,6 +74,7 @@ impl TestServer {
             config: Mutex::new(server_config(host_key)),
             authorized: Mutex::new(Vec::new()),
             allow_exec: Mutex::new(true),
+            allow_forwarding: Mutex::new(true),
             counters: Counters::default(),
             sessions: Mutex::new(Vec::new()),
         });
@@ -80,10 +87,12 @@ impl TestServer {
                 // The session talks through a pipe; aborting the pump drops
                 // the TCP socket like a dead network, without a goodbye.
                 let (inner, mut outer) = tokio::io::duplex(1 << 16);
+                let done = st.clone();
                 tokio::spawn(async move {
                     if let Ok(session) = russh::server::run_stream(config, inner, handler).await {
                         let _ = session.await;
                     }
+                    done.counters.closed.fetch_add(1, Ordering::SeqCst);
                 });
                 let pump = tokio::spawn(async move {
                     let mut sock = sock;
@@ -113,6 +122,17 @@ impl TestServer {
     pub fn count(&self, f: impl Fn(&Counters) -> &AtomicUsize) -> usize {
         f(&self.state.counters).load(Ordering::SeqCst)
     }
+
+    /// Wait (up to 5 s) until every session the server accepted has ended.
+    pub async fn all_closed(&self) -> bool {
+        for _ in 0..100 {
+            if self.count(|c| &c.closed) == self.count(|c| &c.connections) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
 }
 
 struct SshHandler {
@@ -124,7 +144,13 @@ impl russh::server::Handler for SshHandler {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        Ok(if user == USER && password == PASSWORD { Auth::Accept } else { Auth::reject() })
+        if user == USER && password == PASSWORD {
+            return Ok(Auth::Accept);
+        }
+        // Like OpenSSH: a wrong password may be retried (russh would drop
+        // "password" from the methods left).
+        let methods = [russh::MethodKind::PublicKey, russh::MethodKind::Password];
+        Ok(Auth::Reject { proceed_with_methods: Some((&methods[..]).into()), partial_success: false })
     }
 
     async fn auth_publickey(&mut self, user: &str, key: VerifiedPublicKey<'_>) -> Result<Auth, Self::Error> {
@@ -141,6 +167,39 @@ impl russh::server::Handler for SshHandler {
     ) -> Result<(), Self::Error> {
         self.channels.insert(channel.id(), channel);
         reply.accept().await;
+        Ok(())
+    }
+
+    /// Act as a jump host: connect to the target and pump bytes.
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.state.counters.forwards.fetch_add(1, Ordering::SeqCst);
+        if !*self.state.allow_forwarding.lock().unwrap() {
+            reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+            return Ok(());
+        }
+        let Ok(port) = u16::try_from(port_to_connect) else {
+            reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+            return Ok(());
+        };
+        match tokio::net::TcpStream::connect((host_to_connect, port)).await {
+            Ok(mut tcp) => {
+                reply.accept().await;
+                tokio::spawn(async move {
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+                });
+            }
+            Err(_) => reply.reject(russh::ChannelOpenFailure::ConnectFailed).await,
+        }
         Ok(())
     }
 
@@ -405,6 +464,8 @@ pub struct TestPrompter {
     pub accept_host_key: bool,
     pub password: Option<String>,
     pub passphrase: Option<String>,
+    /// Ticks "Remember in keychain" on every answer.
+    pub remember: bool,
     pub host_key_asked: AtomicUsize,
     pub password_asked: AtomicUsize,
     pub passphrase_asked: AtomicUsize,
@@ -433,27 +494,77 @@ impl Prompter for TestPrompter {
         self.accept_host_key
     }
 
-    async fn password(&self, _host: &str, user: &str) -> Option<String> {
+    async fn password(&self, _host: &str, user: &str) -> Option<Secret> {
         assert_eq!(user, USER);
         self.password_asked.fetch_add(1, Ordering::SeqCst);
-        self.password.clone()
+        self.password.clone().map(|value| Secret { value, remember: self.remember })
     }
 
-    async fn passphrase(&self, _host: &str, _key_path: &str) -> Option<String> {
+    async fn passphrase(&self, _host: &str, _key_path: &str) -> Option<Secret> {
         self.passphrase_asked.fetch_add(1, Ordering::SeqCst);
-        self.passphrase.clone()
+        self.passphrase.clone().map(|value| Secret { value, remember: self.remember })
+    }
+}
+
+/// An in-memory keychain. `broken` makes every call fail like Linux
+/// without a Secret Service.
+#[derive(Debug, Default)]
+pub struct MemorySecrets {
+    pub items: Mutex<HashMap<String, String>>,
+    pub broken: AtomicBool,
+    pub calls: AtomicUsize,
+}
+
+impl MemorySecrets {
+    fn check(&self) -> Result<(), VfsError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(VfsError::Other("no secret service".into()));
+        }
+        Ok(())
+    }
+
+    /// The saved JSON item for `alias`, parsed.
+    pub fn item(&self, alias: &str) -> Option<serde_json::Value> {
+        let items = self.items.lock().unwrap();
+        items.get(&format!("host:{alias}")).map(|s| serde_json::from_str(s).unwrap())
+    }
+
+    pub fn put(&self, alias: &str, json: serde_json::Value) {
+        self.items.lock().unwrap().insert(format!("host:{alias}"), json.to_string());
+    }
+}
+
+impl SecretStore for MemorySecrets {
+    fn get(&self, account: &str) -> Result<Option<String>, VfsError> {
+        self.check()?;
+        Ok(self.items.lock().unwrap().get(account).cloned())
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<(), VfsError> {
+        self.check()?;
+        self.items.lock().unwrap().insert(account.into(), secret.into());
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> Result<(), VfsError> {
+        self.check()?;
+        self.items.lock().unwrap().remove(account);
+        Ok(())
     }
 }
 
 /// A fake `~/.ssh` in a temp dir: config pointing at the test server,
-/// known_hosts, keys. The agent is off unless a test turns it on.
+/// known_hosts, keys, hosts.json, an in-memory keychain. The agent is off
+/// unless a test turns it on.
 pub struct Home {
     pub dir: tempfile::TempDir,
+    pub secrets: Arc<MemorySecrets>,
 }
 
 impl Home {
     pub fn new() -> Self {
-        Self { dir: tempfile::tempdir().unwrap() }
+        Self { dir: tempfile::tempdir().unwrap(), secrets: Arc::default() }
     }
 
     pub fn path(&self, name: &str) -> PathBuf {
@@ -475,6 +586,8 @@ impl Home {
         SshOptions {
             config_path: self.path("config"),
             known_hosts: self.path("known_hosts"),
+            hosts_file: self.path("app/hosts.json"),
+            secrets: self.secrets.clone(),
             agent: None,
             default_identities: vec![self.path("id_ed25519")],
             keepalive: Duration::from_secs(30),

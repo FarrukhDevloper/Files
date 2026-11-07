@@ -11,6 +11,7 @@ tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 dirs.workspace = true
@@ -19,6 +20,7 @@ russh-sftp.workspace = true
 hmac.workspace = true
 sha1.workspace = true
 uuid.workspace = true
+keyring.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

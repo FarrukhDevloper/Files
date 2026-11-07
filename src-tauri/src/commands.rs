@@ -4,8 +4,7 @@
 use serde::Serialize;
 use tauri::State;
 use tokio::io::AsyncReadExt;
-use vpsfiles_ssh::{ConnStatus, HostConfig};
-use vpsfiles_stream::MediaServer;
+use vpsfiles_ssh::{ConnStatus, HostConfig, HostDraft};
 use vpsfiles_transfer::{JobId, JobSnapshot, TransferRequest};
 use vpsfiles_vfs::{local, path, DiskSpace, Entry, Location, Place, Result, SourceId, VfsError};
 
@@ -39,6 +38,32 @@ pub fn list_hosts(state: State<'_, AppState>) -> Result<Vec<HostInfo>> {
         .into_iter()
         .map(|config| HostInfo { status: state.ssh.status(&config.alias), config })
         .collect())
+}
+
+/// Create (`previous_alias` = None) or update an app-managed server.
+#[tauri::command]
+pub async fn save_host(
+    state: State<'_, AppState>,
+    draft: HostDraft,
+    previous_alias: Option<String>,
+) -> Result<HostInfo> {
+    let config = state.ssh.save_host(draft, previous_alias.as_deref()).await?;
+    Ok(HostInfo { status: state.ssh.status(&config.alias), config })
+}
+
+#[tauri::command]
+pub async fn remove_host(state: State<'_, AppState>, alias: String) -> Result<()> {
+    state.ssh.remove_host(&alias).await
+}
+
+#[tauri::command]
+pub async fn forget_password(state: State<'_, AppState>, alias: String) -> Result<()> {
+    state.ssh.forget_password(&alias).await
+}
+
+#[tauri::command]
+pub fn ssh_config_path(state: State<'_, AppState>) -> String {
+    state.ssh.config_path().display().to_string()
 }
 
 #[tauri::command]
@@ -146,15 +171,6 @@ pub async fn read_text(
     })
 }
 
-#[tauri::command]
-pub async fn open_external(location: Location) -> Result<()> {
-    if location.source != SourceId::Local {
-        return Err(VfsError::Unsupported("opening remote files externally".into()));
-    }
-    tauri_plugin_opener::open_path(local::to_native(&location.path), None::<&str>)
-        .map_err(|e| VfsError::Other(e.to_string()))
-}
-
 // ---- transfers -------------------------------------------------------------
 
 /// `async` so it runs on the tokio runtime the job worker is spawned onto.
@@ -192,11 +208,7 @@ pub fn transfer_clear_finished(state: State<'_, AppState>) {
 
 #[tauri::command]
 pub async fn media_url(state: State<'_, AppState>, location: Location) -> Result<String> {
-    let server = state
-        .media
-        .get_or_try_init(|| MediaServer::start(state.resolver.clone()))
-        .await?;
-    Ok(server.url_for(&location))
+    Ok(state.media().await?.url_for(&location))
 }
 
 #[tauri::command]
@@ -205,8 +217,9 @@ pub fn prompt_respond(
     id: String,
     accept: bool,
     secret: Option<String>,
+    remember: bool,
 ) -> Result<()> {
-    if state.prompter.respond(&id, Answer { accept, secret }) {
+    if state.prompter.respond(&id, Answer { accept, secret, remember }) {
         Ok(())
     } else {
         Err(VfsError::NotFound(format!("prompt {id} expired")))

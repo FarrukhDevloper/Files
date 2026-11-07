@@ -2,16 +2,22 @@
 // ⌘ on macOS. Sheets, menus and text fields handle their own keys first.
 
 import {
-  backgroundMenu, copySelection, deleteSelection, entryMenu, getInfo, goToFolder, newFolder, openPreferences, openSelection,
-  paste, startRename, toggleQuickLook,
+  backgroundMenu, copySelection, deleteSelection, entryMenu, getInfo, goToFolder, newFolder, newTab, openPreferences,
+  openSelection, paste, startRename, toggleQuickLook,
 } from "$lib/actions";
+import { prefs } from "$lib/stores/prefs.svelte";
 import { prompts } from "$lib/stores/prompts.svelte";
 import { tabs } from "$lib/stores/tabs.svelte";
 import { ui } from "$lib/stores/ui.svelte";
 import { hasMod, isTextInput } from "$lib/util/platform";
+import { stepSize } from "$lib/util/zoom";
 
 export function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented || e.isComposing) return;
+  if (zoomKeys(e)) {
+    e.preventDefault();
+    return;
+  }
   if (ui.sheet || prompts.current || ui.menu) return;
   const mod = hasMod(e);
   const key = e.key;
@@ -53,8 +59,8 @@ export function handleKeydown(e: KeyboardEvent) {
       case "x": copySelection(b, "move"); break;
       case "v": void paste(b); break;
       case "n": if (e.shiftKey) void newFolder(b); else handled = false; break;
-      case "l": goToFolder(b); break;
-      case "g": if (e.shiftKey) goToFolder(b); else handled = false; break;
+      case "l": goToFolder(); break;
+      case "g": if (e.shiftKey) goToFolder(); else handled = false; break;
       case "h": case ".": b.toggleHidden(); break;
       case "f": ui.focusSearch(); break;
       case "i": getInfo(b); break;
@@ -154,7 +160,7 @@ function tabKeys(e: KeyboardEvent, mod: boolean): boolean {
   } else if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === "PageDown" || e.key === "PageUp")) {
     tabs.cycle(e.key === "PageDown" ? 1 : -1);
   } else if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "t") {
-    tabs.open();
+    newTab();
   } else if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "w") {
     // Never close the window from here; with one tab this is a no-op.
     tabs.close();
@@ -164,8 +170,20 @@ function tabKeys(e: KeyboardEvent, mod: boolean): boolean {
   return true;
 }
 
+/** Mod+= / Mod+- / Mod+0 change the interface size, wherever focus is.
+ *  Matched by physical key so non-US layouts work too. */
+function zoomKeys(e: KeyboardEvent): boolean {
+  if (!hasMod(e) || e.altKey) return false;
+  const code = e.code;
+  if (code === "Equal" || code === "NumpadAdd" || e.key === "+") prefs.uiScale = stepSize(prefs.uiScale, 1);
+  else if (code === "Minus" || code === "NumpadSubtract") prefs.uiScale = stepSize(prefs.uiScale, -1);
+  else if ((code === "Digit0" || code === "Numpad0") && !e.shiftKey) prefs.uiScale = 1;
+  else return false;
+  return true;
+}
+
 function pageSize(): number {
-  return Math.max(1, Math.floor((window.innerHeight - 140) / 24));
+  return Math.max(1, Math.floor((window.innerHeight - 160) / 28));
 }
 
 /** Mouse buttons 4/5 = back/forward. */

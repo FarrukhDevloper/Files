@@ -3,8 +3,12 @@
   import X from "@lucide/svelte/icons/x";
   import ExternalLink from "@lucide/svelte/icons/external-link";
   import Copy from "@lucide/svelte/icons/copy";
+  import Play from "@lucide/svelte/icons/play";
   import FileIcon from "./FileIcon.svelte";
+  import { openInPlayer, openWithDefaultApp, playerLabel } from "$lib/actions";
   import { api } from "$lib/ipc/api";
+  import { thumbUrl } from "$lib/ipc/media";
+  import { edits } from "$lib/stores/edits.svelte";
   import type { Entry } from "$lib/ipc/types";
   import { tabs } from "$lib/stores/tabs.svelte";
   import { toasts } from "$lib/stores/toasts.svelte";
@@ -22,6 +26,8 @@
     b.cursor !== null ? b.items[b.index.get(b.cursor) ?? -1] : b.selection[0],
   );
   const kind = $derived(entry ? previewKind(entry) : "none");
+  const player = $derived((kind === "video" || kind === "audio") && edits.players.length ? edits.players[0]! : null);
+  const poster = $derived(entry && b.location && kind === "video" ? thumbUrl(b.locationOf(entry), 512, entry.modified) ?? undefined : undefined);
 
   type Loaded =
     | { kind: "loading" }
@@ -84,9 +90,14 @@
     ui.quickLook = false;
   }
 
-  async function openExternally() {
-    if (!entry || !b.location) return;
-    await api.openExternal(b.locationOf(entry)).catch((e) => toasts.error(e, `Couldn't open “${entry.name}”`));
+  function openExternally() {
+    if (entry && b.location) void openWithDefaultApp(entry, b.locationOf(entry));
+  }
+
+  function play() {
+    if (!entry || !b.location || !player) return;
+    close(); // the player takes over; don't keep a second stream running
+    void openInPlayer(entry, b.locationOf(entry), player);
   }
 
   async function copyUrl() {
@@ -110,7 +121,10 @@
         {#if mediaUrl && b.location?.source.kind === "ssh"}
           <button class="tool" title="Copy stream URL" aria-label="Copy stream URL" onclick={copyUrl}><Copy size={15} /></button>
         {/if}
-        {#if b.location?.source.kind === "local" && entry.kind === "file"}
+        {#if player}
+          <button class="tool" title="Play in {playerLabel(player)}" aria-label="Play in {playerLabel(player)}" onclick={play}><Play size={15} /></button>
+        {/if}
+        {#if entry.kind === "file"}
           <button class="tool" title="Open with default app" aria-label="Open with default app" onclick={openExternally}><ExternalLink size={15} /></button>
         {/if}
       </header>
@@ -123,7 +137,7 @@
             <img src={loaded.url} alt={entry.name} onerror={() => (mediaFailed = true)} />
           {:else if kind === "video"}
             <!-- svelte-ignore a11y_media_has_caption -->
-            <video src={loaded.url} controls autoplay preload="metadata" onerror={() => (mediaFailed = true)}></video>
+            <video src={loaded.url} {poster} controls autoplay preload="metadata" onerror={() => (mediaFailed = true)}></video>
           {:else}
             <div class="audio">
               <FileIcon type="audio" size={96} />
@@ -140,8 +154,9 @@
             <p>{kindLabel(entry)}{entry.kind === "file" ? ` · ${formatSize(entry.size)}` : ""}</p>
             <p>Modified {formatDate(entry.modified)}</p>
             {#if mediaFailed}
-              <p class="note">This format can't be played here.{b.location?.source.kind === "ssh" ? " Copy the stream URL to open it in mpv or VLC." : ""}</p>
-              {#if mediaUrl}<button class="btn" onclick={copyUrl}>Copy Stream URL</button>{/if}
+              <p class="note">This format can't be played here.{player ? "" : b.location?.source.kind === "ssh" ? " Copy the stream URL to open it in mpv or VLC." : ""}</p>
+              {#if player}<button class="btn primary" onclick={play}>Play in {playerLabel(player)}</button>
+              {:else if mediaUrl}<button class="btn" onclick={copyUrl}>Copy Stream URL</button>{/if}
             {:else if loaded.kind === "none" && loaded.note}
               <p class="note">{loaded.note}</p>
             {/if}
@@ -193,7 +208,7 @@
   h2 {
     flex: 1;
     margin: 0;
-    font-size: 13px;
+    font-size: var(--fs-ui);
     font-weight: 600;
     text-align: center;
     overflow: hidden;
@@ -226,8 +241,8 @@
   }
   .more { color: var(--fg-tertiary); }
   .fallback { display: flex; flex-direction: column; align-items: center; gap: 4px; text-align: center; padding: 24px; }
-  .fallback h3 { margin: 12px 0 0; font-size: 15px; }
-  .fallback p { margin: 0; color: var(--fg-secondary); font-size: 12px; }
+  .fallback h3 { margin: 12px 0 0; font-size: 16px; }
+  .fallback p { margin: 0; color: var(--fg-secondary); font-size: var(--fs-secondary); }
   .fallback .note { margin: 10px 0 4px; max-width: 380px; }
   footer {
     flex: none;

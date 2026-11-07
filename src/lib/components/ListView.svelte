@@ -3,6 +3,8 @@
   import ChevronUp from "@lucide/svelte/icons/chevron-up";
   import ChevronDown from "@lucide/svelte/icons/chevron-down";
   import FileIcon from "./FileIcon.svelte";
+  import Thumb from "./Thumb.svelte";
+  import { wantsThumbnail } from "$lib/thumbs.svelte";
   import RenameField from "./RenameField.svelte";
   import { itemPointer } from "./itemPointer";
   import { scrollMemory } from "./scrollMemory";
@@ -18,8 +20,8 @@
 
   let { b }: { b: Browser } = $props();
 
-  const ROW = 24;
-  const HEADER = 24;
+  const ROW = 28;
+  const HEADER = 28;
   const PAD = 4;
   const OVERSCAN = 12;
 
@@ -33,9 +35,9 @@
   const end = $derived(Math.min(b.items.length, Math.ceil((scrollTop + height) / ROW) + OVERSCAN));
   const rows = $derived(b.items.slice(start, end));
 
-  const showDate = $derived(width === 0 || width > 470);
-  const showKind = $derived(width === 0 || width > 640);
-  const columns = $derived(`minmax(0, 1fr)${showDate ? " 168px" : ""} 84px${showKind ? " 150px" : ""}`);
+  const showDate = $derived(width === 0 || width > 520);
+  const showKind = $derived(width === 0 || width > 720);
+  const columns = $derived(`minmax(0, 1fr)${showDate ? " 190px" : ""} 92px${showKind ? " 170px" : ""}`);
   const srcKey = $derived(b.location ? sourceKey(b.location.source) : "");
   const cutPrefix = $derived(b.location ? `${srcKey}|` : "");
 
@@ -139,7 +141,11 @@
           oncontextmenu={(e) => entryMenu(b, e, entry)}
         >
           <div class="cell name">
-            <FileIcon type={iconFor(entry)} link={entry.isSymlink} />
+            {#if b.location && wantsThumbnail(entry, b.location, true)}
+              <Thumb {entry} location={b.locationOf(entry)} size={20} />
+            {:else}
+              <FileIcon type={iconFor(entry)} size={20} link={entry.isSymlink} />
+            {/if}
             {#if b.renaming === entry.path}
               <RenameField {entry} oncommit={(name) => commitRename(b, entry, name)} oncancel={() => (b.renaming = null)} />
             {:else}
@@ -171,7 +177,7 @@
     position: sticky;
     top: 0;
     z-index: 1;
-    height: 24px;
+    height: 28px;
     background: var(--bg-window);
     box-shadow: 0 1px 0 var(--separator), -8px 0 0 var(--bg-window), 8px 0 0 var(--bg-window);
     font-size: var(--fs-small);
@@ -193,8 +199,8 @@
     content: "";
     position: absolute;
     left: 0;
-    top: 5px;
-    bottom: 5px;
+    top: 6px;
+    bottom: 6px;
     width: 1px;
     background: var(--separator);
   }
@@ -237,7 +243,7 @@
     text-overflow: ellipsis;
     font-variant-numeric: tabular-nums;
   }
-  .cell.name { display: flex; align-items: center; gap: 6px; padding-left: 6px; }
+  .cell.name { display: flex; align-items: center; gap: 7px; padding-left: 6px; }
   .name-text { overflow: hidden; text-overflow: ellipsis; }
   .muted { color: var(--fg-secondary); }
   .right { text-align: right; }

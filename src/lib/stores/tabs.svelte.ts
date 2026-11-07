@@ -9,8 +9,9 @@ class Tabs {
   active = $state(0);
   current = $derived(this.list[this.active] ?? this.list[0]!);
 
-  /** New tab right after the active one, showing `at` (default: the same folder). */
-  open(from: Browser = this.current, at: Location | null = from.location): Browser {
+  /** New tab right after the active one, showing `at` (null: nothing yet —
+   *  the caller shows the start page, see actions.newTab). */
+  open(from: Browser = this.current, at: Location | null = null): Browser {
     const b = new Browser();
     b.view = from.view;
     b.sort = from.sort;

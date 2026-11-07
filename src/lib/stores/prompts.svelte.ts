@@ -15,12 +15,13 @@ class Prompts {
     });
   }
 
-  async respond(accept: boolean, secret: string | null = null) {
+  /** `remember` saves the password/passphrase in the OS keychain. */
+  async respond(accept: boolean, secret: string | null = null, remember = false) {
     const p = this.current;
     if (!p) return;
     this.queue = this.queue.slice(1);
     try {
-      await api.promptRespond(p.id, accept, accept ? secret : null);
+      await api.promptRespond(p.id, accept, accept ? secret : null, accept && remember);
     } catch (e) {
       toasts.error(e, "Couldn't send the answer");
     }

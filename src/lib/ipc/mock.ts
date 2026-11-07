@@ -5,7 +5,7 @@
 
 import type { Api } from "./api";
 import type {
-  ConnStatus, Entry, EventMap, HostInfo, JobSnapshot, Location, Place,
+  ConnStatus, EditSession, EditState, Entry, EventMap, HostInfo, JobSnapshot, Location, Place,
   PromptRequest, SourceId, VfsError,
 } from "./types";
 
@@ -71,7 +71,9 @@ const trees = new Map<string, Node>([
   })],
 ]);
 
-const hosts: Omit<HostInfo, "status">[] = [
+const hosts: (Omit<HostInfo, "status" | "origin" | "hasSavedSecret"> & { origin?: HostInfo["origin"] })[] = [
+  // Added in the app (editable): key login, no prompts.
+  { alias: "lab", hostname: "198.51.100.7", user: "dev", port: 22, identityFiles: ["~/.ssh/lab_ed25519"], proxyJump: null, forwardAgent: false, origin: "app" },
   { alias: "demo-web", hostname: "203.0.113.10", user: "deploy", port: 22, identityFiles: ["~/.ssh/id_ed25519"], proxyJump: null, forwardAgent: false },
   // Unknown host key on first connect → hostKey prompt.
   { alias: "demo-db", hostname: "203.0.113.20", user: "admin", port: 2222, identityFiles: [], proxyJump: null, forwardAgent: false },
@@ -83,9 +85,39 @@ const hosts: Omit<HostInfo, "status">[] = [
 trees.set("ssh:demo-pass", dir({ root: dir({ "notes.txt": file(812) }), etc: dir({ hostname: file(12) }) }));
 const homes: Record<string, string> = { local: "/home/me", "ssh:demo-web": "/home/deploy", "ssh:demo-db": "/home/admin", "ssh:demo-pass": "/root" };
 const trustedHosts = new Set(["demo-web", "demo-pass", "demo-down"]);
-const pendingPrompts = new Map<string, (answer: { accept: boolean; secret: string | null }) => void>();
+type Answer = { accept: boolean; secret: string | null; remember: boolean };
+const pendingPrompts = new Map<string, (answer: Answer) => void>();
+/** The "OS keychain": passwords saved per host alias. */
+const keychain = new Map<string, string>();
 
-function ask(request: PromptRequest): Promise<{ accept: boolean; secret: string | null }> {
+/** A small server filesystem for hosts added in the app. */
+function serverTree(user: string): Node {
+  const home = dir({ "README.txt": file(1_420), projects: dir({ api: dir({ "main.go": file(8_201) }) }), ".bashrc": file(3_771, 90) });
+  return dir({
+    root: user === "root" ? home : dir({}),
+    home: user === "root" ? dir({}) : dir({ [user]: home }),
+    etc: dir({ hostname: file(9), "os-release": file(386, 120) }),
+    var: dir({ log: dir({ "syslog": file(1_048_576, 0), "auth.log": file(204_800, 0) }) }),
+  });
+}
+
+function addServerFiles(alias: string, user: string | null) {
+  const u = user ?? "root";
+  trees.set(`ssh:${alias}`, serverTree(u));
+  homes[`ssh:${alias}`] = u === "root" ? "/root" : `/home/${u}`;
+}
+addServerFiles("lab", "dev");
+
+/** demo-pass wants "demo"; app hosts without a key take any password. */
+function needsPassword(alias: string): boolean {
+  const h = hosts.find((x) => x.alias === alias);
+  return alias === "demo-pass" || (h?.origin === "app" && h.identityFiles.length === 0);
+}
+function passwordOk(alias: string, secret: string | null): boolean {
+  return alias === "demo-pass" ? secret === "demo" : !!secret;
+}
+
+function ask(request: PromptRequest): Promise<Answer> {
   return new Promise((resolve) => {
     pendingPrompts.set(request.id, resolve);
     emit("prompt:request", request);
@@ -211,10 +243,39 @@ function setJobState(id: string, state: JobSnapshot["state"]) {
   emit("transfer:update", next);
 }
 
+// ---- edit sessions: a remote file "open in its app" ----
+// downloading → open → (a save) uploading → synced. On demo-db somebody else
+// changes the file meanwhile, so the save ends in "conflict".
+
+const edits = new Map<string, EditSession>();
+const editTimers = new Map<string, ReturnType<typeof setTimeout>[]>();
+const CONFLICT_HOST = "demo-db";
+
+function editSet(id: string, state: EditState, patch: Partial<EditSession> = {}) {
+  const s = edits.get(id);
+  if (!s) return;
+  const next = { ...s, ...patch, state };
+  if (state === "closed") edits.delete(id);
+  else edits.set(id, next);
+  emit("edit:update", next);
+}
+
+/** Run `steps` one after another; Stop cancels what's left. */
+function editPlan(id: string, steps: [number, () => void][]) {
+  for (const t of editTimers.get(id) ?? []) clearTimeout(t);
+  let at = 0;
+  editTimers.set(id, steps.map(([delay, fn]) => setTimeout(fn, (at += delay))));
+}
+
+function touchRemote(loc: Location) {
+  const node = lookup(loc);
+  if (node.kind === "file") node.modified = Date.now();
+}
+
 export function createMockApi(): Api {
   return {
     async listHosts() {
-      return hosts.map((h) => ({ ...h, status: status.get(h.alias)! }));
+      return hosts.map((h) => ({ ...h, origin: h.origin ?? "sshConfig", hasSavedSecret: keychain.has(h.alias), status: status.get(h.alias)! }));
     },
     async connectHost(alias) {
       if (!status.has(alias)) fail("not_found", alias);
@@ -235,10 +296,16 @@ export function createMockApi(): Api {
         if (!answer.accept) failWith({ code: "cancelled", message: "Host key not trusted" });
         trustedHosts.add(alias);
       }
-      if (alias === "demo-pass") {
-        const answer = await ask({ kind: "password", id: crypto.randomUUID(), host: alias, user: "root" });
-        if (!answer.accept) failWith({ code: "cancelled", message: "Password prompt cancelled" });
-        if (answer.secret !== "demo") failWith({ code: "auth", message: "Permission denied (publickey,password)" });
+      if (needsPassword(alias)) {
+        const saved = keychain.get(alias);
+        if (saved !== undefined && !passwordOk(alias, saved)) keychain.delete(alias); // stale: ask again
+        if (!keychain.has(alias)) {
+          const user = hosts.find((h) => h.alias === alias)?.user ?? "root";
+          const answer = await ask({ kind: "password", id: crypto.randomUUID(), host: alias, user });
+          if (!answer.accept) failWith({ code: "cancelled", message: "Password prompt cancelled" });
+          if (!passwordOk(alias, answer.secret)) failWith({ code: "auth", message: "Permission denied (publickey,password)" });
+          if (answer.remember) keychain.set(alias, answer.secret!);
+        }
       }
       status.set(alias, { state: "connected" });
       emit("conn:status", { host: alias, status: { state: "connected" } });
@@ -246,6 +313,58 @@ export function createMockApi(): Api {
     async disconnectHost(alias) {
       status.set(alias, { state: "disconnected" });
       emit("conn:status", { host: alias, status: { state: "disconnected" } });
+    },
+    async saveHost(draft, previousAlias) {
+      await sleep(150);
+      if (!/^[A-Za-z0-9._-]{1,64}$/.test(draft.alias)) fail("invalid_name", draft.alias);
+      if (!draft.hostname.trim()) fail("invalid_name", "empty host name");
+      const i = previousAlias !== null ? hosts.findIndex((h) => h.alias === previousAlias) : -1;
+      if (previousAlias !== null && i < 0) fail("not_found", previousAlias);
+      if (i >= 0 && hosts[i]!.origin !== "app") fail("unsupported", `${previousAlias} is defined in ~/.ssh/config`);
+      if (draft.alias !== previousAlias && hosts.some((h) => h.alias === draft.alias)) fail("already_exists", draft.alias);
+      const host = {
+        alias: draft.alias, hostname: draft.hostname, user: draft.user, port: draft.port,
+        identityFiles: draft.identityFile ? [draft.identityFile] : [], proxyJump: null,
+        forwardAgent: false, origin: "app" as const,
+      };
+      if (i >= 0) {
+        // Editing drops the connection; a rename carries files and secrets over.
+        const old = previousAlias!;
+        if (status.get(old)?.state !== "disconnected") emit("conn:status", { host: old, status: { state: "disconnected" } });
+        status.delete(old);
+        if (old !== draft.alias) {
+          trees.set(`ssh:${draft.alias}`, trees.get(`ssh:${old}`)!);
+          trees.delete(`ssh:${old}`);
+          homes[`ssh:${draft.alias}`] = homes[`ssh:${old}`]!;
+          const secret = keychain.get(old);
+          keychain.delete(old);
+          if (secret !== undefined) keychain.set(draft.alias, secret);
+        }
+        hosts[i] = host;
+      } else {
+        hosts.push(host);
+        addServerFiles(draft.alias, draft.user);
+      }
+      status.set(draft.alias, { state: "disconnected" });
+      if (draft.password) keychain.set(draft.alias, draft.password);
+      return { ...host, hasSavedSecret: keychain.has(draft.alias), status: status.get(draft.alias)! };
+    },
+    async removeHost(alias) {
+      const i = hosts.findIndex((h) => h.alias === alias);
+      if (i < 0) fail("not_found", alias);
+      if (hosts[i]!.origin !== "app") fail("unsupported", `${alias} is defined in ~/.ssh/config`);
+      if (status.get(alias)?.state !== "disconnected") emit("conn:status", { host: alias, status: { state: "disconnected" } });
+      hosts.splice(i, 1);
+      status.delete(alias);
+      keychain.delete(alias);
+      trees.delete(`ssh:${alias}`);
+    },
+    async forgetPassword(alias) {
+      if (!status.has(alias)) fail("not_found", alias);
+      keychain.delete(alias);
+    },
+    async sshConfigPath() {
+      return "/home/me/.ssh/config";
     },
 
     async localPlaces(): Promise<Place[]> {
@@ -318,6 +437,47 @@ export function createMockApi(): Api {
     },
     async openExternal(loc) {
       console.info("[mock] open externally:", loc);
+      if (loc.source.kind === "local") return null;
+      requireConnected(loc.source);
+      const node = lookup(loc);
+      if (node.kind !== "file") fail("is_a_directory", loc.path);
+      const id = crypto.randomUUID();
+      const s: EditSession = {
+        id, location: loc, localPath: `/tmp/vps-files/edit/${id.slice(0, 8)}/${split(loc.path).at(-1)}`,
+        state: "downloading", error: null, lastSync: null,
+      };
+      edits.set(id, s);
+      const conflict = loc.source.host === CONFLICT_HOST;
+      editPlan(id, [
+        [Math.min(4000, 500 + node.size / 40_000), () => editSet(id, "open")],
+        // The user saves in their editor a few seconds later.
+        [3500, () => editSet(id, "uploading")],
+        [900, () => {
+          if (conflict) editSet(id, "conflict");
+          else {
+            touchRemote(loc);
+            editSet(id, "synced", { lastSync: Date.now() });
+          }
+        }],
+      ]);
+      return s;
+    },
+    async editList() {
+      return [...edits.values()];
+    },
+    async editStop(id) {
+      if (!edits.has(id)) fail("not_found", id);
+      editPlan(id, []);
+      editTimers.delete(id);
+      editSet(id, "closed");
+    },
+    async editResolve(id, action) {
+      const s = edits.get(id);
+      if (!s) fail("not_found", id);
+      if (s.state !== "conflict") fail("other", "No conflict to resolve");
+      editPlan(id, action === "upload"
+        ? [[0, () => editSet(id, "uploading")], [900, () => { touchRemote(s.location); editSet(id, "synced", { lastSync: Date.now() }); }]]
+        : [[0, () => editSet(id, "downloading")], [700, () => editSet(id, "open")]]);
     },
 
     async transferStart(req) {
@@ -391,11 +551,21 @@ export function createMockApi(): Api {
       return "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm";
     },
 
-    async promptRespond(id, accept, secret) {
+    async mediaBase() {
+      return ""; // no media server in the browser: media.ts returns null URLs
+    },
+    async externalPlayers() {
+      return ["mpv"];
+    },
+    async openInPlayer(loc) {
+      console.info("[mock] open in player:", loc);
+    },
+
+    async promptRespond(id, accept, secret, remember) {
       const resolve = pendingPrompts.get(id);
       if (!resolve) fail("not_found", `prompt ${id}`);
       pendingPrompts.delete(id);
-      resolve({ accept, secret });
+      resolve({ accept, secret, remember: remember ?? false });
     },
 
     async on(event, handler) {

@@ -1,5 +1,8 @@
 //! Client authentication, in OpenSSH order: ssh-agent → identity files
 //! (passphrase via the prompter) → password / keyboard-interactive.
+//!
+//! Passwords and passphrases saved in the keychain are tried before asking;
+//! a saved one that turns out wrong is deleted and the user is asked.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +15,7 @@ use russh::{MethodKind, MethodSet};
 use vpsfiles_vfs::{Result, VfsError};
 
 use crate::manager::{ssh_error, Client};
+use crate::secrets::{HostSecrets, Secrets};
 use crate::{HostConfig, Prompter};
 
 /// Wrong passphrases/passwords before we give up on that secret.
@@ -53,7 +57,7 @@ impl IdentityFile {
     }
 
     /// Decrypt if needed. `None` = skip this key (unreadable or cancelled).
-    async fn load(&self, alias: &str, prompter: &dyn Prompter) -> Option<PrivateKey> {
+    async fn load(&self, alias: &str, prompter: &dyn Prompter, saved: &mut Saved<'_>) -> Option<PrivateKey> {
         match russh::keys::decode_secret_key(&self.text, None) {
             Ok(k) => return Some(k),
             Err(russh::keys::Error::KeyIsEncrypted) => {}
@@ -63,14 +67,46 @@ impl IdentityFile {
             }
         }
         let shown = self.path.display().to_string();
-        for _ in 0..SECRET_ATTEMPTS {
-            let pass = prompter.passphrase(alias, &shown).await?;
+        if let Some(pass) = saved.get().await.passphrases.get(&shown).cloned() {
             match russh::keys::decode_secret_key(&self.text, Some(&pass)) {
                 Ok(k) => return Some(k),
+                Err(_) => saved.update(|s| drop(s.passphrases.remove(&shown))).await,
+            }
+        }
+        for _ in 0..SECRET_ATTEMPTS {
+            let pass = prompter.passphrase(alias, &shown).await?;
+            match russh::keys::decode_secret_key(&self.text, Some(&pass.value)) {
+                Ok(k) => {
+                    if pass.remember {
+                        saved.update(|s| drop(s.passphrases.insert(shown, pass.value))).await;
+                    }
+                    return Some(k);
+                }
                 Err(e) => tracing::debug!("{shown}: wrong passphrase: {e}"),
             }
         }
         None
+    }
+}
+
+/// The host's keychain item, read on first need (it may show an unlock
+/// dialog, so not for hosts that never need a secret).
+struct Saved<'a> {
+    secrets: &'a Secrets,
+    alias: &'a str,
+    cached: Option<HostSecrets>,
+}
+
+impl Saved<'_> {
+    async fn get(&mut self) -> &HostSecrets {
+        if self.cached.is_none() {
+            self.cached = Some(self.secrets.load(self.alias).await);
+        }
+        self.cached.as_ref().unwrap()
+    }
+
+    async fn update(&mut self, f: impl FnOnce(&mut HostSecrets)) {
+        self.cached = Some(self.secrets.update(self.alias, f).await);
     }
 }
 
@@ -101,6 +137,7 @@ pub(crate) struct AuthContext<'a> {
     pub agent: Option<&'a Path>,
     pub default_identities: &'a [PathBuf],
     pub prompter: &'a dyn Prompter,
+    pub secrets: &'a Secrets,
 }
 
 pub(crate) async fn authenticate(handle: &mut Handle<Client>, cx: AuthContext<'_>) -> Result<()> {
@@ -117,6 +154,7 @@ pub(crate) async fn authenticate(handle: &mut Handle<Client>, cx: AuthContext<'_
     let files: Vec<IdentityFile> = configured.iter().filter_map(|p| IdentityFile::read(p)).collect();
     let mut rsa = RsaHash(None);
     let mut tried: Vec<PublicKey> = Vec::new();
+    let mut saved = Saved { secrets: cx.secrets, alias, cached: None };
 
     // 1. ssh-agent.
     if let Some(path) = cx.agent.filter(|_| methods.contains(&MethodKind::PublicKey)) {
@@ -156,7 +194,7 @@ pub(crate) async fn authenticate(handle: &mut Handle<Client>, cx: AuthContext<'_
         if tried.iter().any(|k| file.has(k)) {
             continue;
         }
-        let Some(key) = file.load(alias, cx.prompter).await else { continue };
+        let Some(key) = file.load(alias, cx.prompter, &mut saved).await else { continue };
         let hash = rsa.for_key(handle, key.public_key()).await;
         let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
         match handle.authenticate_publickey(user, key).await.map_err(err)? {
@@ -165,22 +203,34 @@ pub(crate) async fn authenticate(handle: &mut Handle<Client>, cx: AuthContext<'_
         }
     }
 
-    // 3. Password, or keyboard-interactive answered with the password (PAM).
+    // 3. Password, or keyboard-interactive answered with the password (PAM):
+    //    the saved one first, then up to SECRET_ATTEMPTS typed ones.
+    if takes_password(&methods)
+        && let Some(password) = saved.get().await.password.clone()
+    {
+        match password_auth(handle, user, &methods, &password).await.map_err(err)? {
+            AuthResult::Success => return Ok(()),
+            AuthResult::Failure { remaining_methods, .. } => {
+                methods = remaining_methods;
+                tracing::info!("{alias}: saved password was rejected; forgetting it");
+                saved.update(|s| s.password = None).await;
+            }
+        }
+    }
     for _ in 0..SECRET_ATTEMPTS {
-        let password_ok = methods.contains(&MethodKind::Password);
-        if !password_ok && !methods.contains(&MethodKind::KeyboardInteractive) {
+        if !takes_password(&methods) {
             break;
         }
         let Some(password) = cx.prompter.password(alias, user).await else {
             return Err(VfsError::Cancelled);
         };
-        let result = if password_ok {
-            handle.authenticate_password(user, password).await.map_err(err)?
-        } else {
-            keyboard_interactive(handle, user, &password).await.map_err(err)?
-        };
-        match result {
-            AuthResult::Success => return Ok(()),
+        match password_auth(handle, user, &methods, &password.value).await.map_err(err)? {
+            AuthResult::Success => {
+                if password.remember {
+                    saved.update(|s| s.password = Some(password.value)).await;
+                }
+                return Ok(());
+            }
             AuthResult::Failure { remaining_methods, .. } => methods = remaining_methods,
         }
     }
@@ -189,6 +239,23 @@ pub(crate) async fn authenticate(handle: &mut Handle<Client>, cx: AuthContext<'_
         "{user}@{alias}: no authentication method succeeded (server accepts: {})",
         names(&methods)
     )))
+}
+
+fn takes_password(methods: &MethodSet) -> bool {
+    methods.contains(&MethodKind::Password) || methods.contains(&MethodKind::KeyboardInteractive)
+}
+
+async fn password_auth(
+    handle: &mut Handle<Client>,
+    user: &str,
+    methods: &MethodSet,
+    password: &str,
+) -> std::result::Result<AuthResult, russh::Error> {
+    if methods.contains(&MethodKind::Password) {
+        handle.authenticate_password(user, password).await
+    } else {
+        keyboard_interactive(handle, user, password).await
+    }
 }
 
 async fn keyboard_interactive(

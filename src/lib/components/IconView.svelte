@@ -2,7 +2,7 @@
   import { untrack } from "svelte";
   import FileIcon from "./FileIcon.svelte";
   import Thumb from "./Thumb.svelte";
-  import { wantsThumbnail } from "$lib/thumbs";
+  import { wantsThumbnail } from "$lib/thumbs.svelte";
   import RenameField from "./RenameField.svelte";
   import { itemPointer } from "./itemPointer";
   import { scrollMemory } from "./scrollMemory";
@@ -16,8 +16,8 @@
 
   let { b }: { b: Browser } = $props();
 
-  const CELL_W = 100;
-  const CELL_H = 104;
+  const CELL_W = 116;
+  const CELL_H = 124;
   const PAD = 12;
   const OVERSCAN = 2;
 
@@ -114,9 +114,9 @@
       >
         <div class="icon">
           {#if b.location && wantsThumbnail(entry, b.location)}
-            <Thumb {entry} location={b.locationOf(entry)} size={64} />
+            <Thumb {entry} location={b.locationOf(entry)} size={72} />
           {:else}
-            <FileIcon type={iconFor(entry)} size={64} link={entry.isSymlink} />
+            <FileIcon type={iconFor(entry)} size={72} link={entry.isSymlink} />
           {/if}
         </div>
         {#if b.renaming === entry.path}
@@ -139,7 +139,7 @@
   .spacer { position: relative; contain: layout; }
   .cell {
     position: absolute;
-    height: 104px;
+    height: 124px;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -154,8 +154,8 @@
     margin-top: 3px;
     padding: 1px 5px;
     border-radius: 4px;
-    font-size: 12px;
-    line-height: 15px;
+    font-size: var(--fs-secondary);
+    line-height: 17px;
     text-align: center;
     word-break: break-word;
     overflow: hidden;

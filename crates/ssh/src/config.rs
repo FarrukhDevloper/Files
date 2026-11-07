@@ -6,8 +6,10 @@
 //! Semantics (ssh_config(5)):
 //! * Options before the first `Host` apply to every host. For each option the
 //!   first value that applies wins; `IdentityFile` accumulates.
-//! * `Host a b` lists `a` and `b`. Patterns with `*`/`?` and negated `!x`
-//!   patterns are never listed, but their options apply to matching aliases.
+//! * `Host a b` lists `a` and `b`, unless the block sets `HostName`: then
+//!   both name one server, listed once as `a` (`b` still connects). Patterns
+//!   with `*`/`?` and negated `!x` patterns are never listed, but their
+//!   options apply to matching aliases.
 //! * `Match all` applies everywhere; any other `Match` block (`exec`, `user`,
 //!   ...) can't be evaluated safely here and never applies.
 //! * `Include` is expanded in place: relative paths live in `~/.ssh/`, globs
@@ -18,13 +20,24 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use vpsfiles_vfs::{Result, VfsError};
 
 /// OpenSSH's limit for nested `Include`s; also stops include cycles.
 const MAX_INCLUDE_DEPTH: usize = 16;
 
-/// One concrete `Host <alias>` block with `Host *` defaults applied.
+/// Where a host is defined. Only [`HostOrigin::App`] hosts are editable in
+/// the app; `~/.ssh/config` stays the user's file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostOrigin {
+    #[default]
+    SshConfig,
+    App,
+}
+
+/// One concrete `Host <alias>` block with `Host *` defaults applied, or an
+/// app-managed server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostConfig {
@@ -37,6 +50,10 @@ pub struct HostConfig {
     pub identity_files: Vec<PathBuf>,
     pub proxy_jump: Option<String>,
     pub forward_agent: bool,
+    pub origin: HostOrigin,
+    /// A password or passphrase is saved in the keychain (from an index
+    /// file, so listing never touches the keychain).
+    pub has_saved_secret: bool,
     /// `IdentitiesOnly yes`: agent keys are used only if they match one of
     /// `identity_files`. Connection-only, not sent to the UI.
     #[serde(skip)]
@@ -71,12 +88,25 @@ pub fn load_hosts_from(path: &Path) -> Result<Vec<HostConfig>> {
 /// Effective settings for `alias`, as `ssh <alias>` would use them. Works for
 /// aliases that aren't listed too (then everything is a default).
 pub fn host_from(path: &Path, alias: &str) -> Result<HostConfig> {
+    host_entry(path, alias).map(|(host, _)| host)
+}
+
+/// Like [`host_from`], plus whether the config names `alias` in a `Host`
+/// line (listed or not).
+pub(crate) fn host_entry(path: &Path, alias: &str) -> Result<(HostConfig, bool)> {
     if alias.is_empty() || alias.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(VfsError::InvalidName(alias.to_string()));
     }
     let ctx = Ctx::user();
     let lines = parse(path, &ctx)?;
-    Ok(evaluate(&lines, alias, &ctx))
+    let named = concrete_names(&lines).iter().any(|a| a == alias);
+    Ok((evaluate(&lines, alias, &ctx), named))
+}
+
+/// Every name the config gives a host (each concrete `Host` pattern), so
+/// app hosts can't take one of them.
+pub(crate) fn names_from(path: &Path) -> Result<Vec<String>> {
+    Ok(concrete_names(&parse(path, &Ctx::user())?))
 }
 
 /// The local user name: OpenSSH's default `User`.
@@ -195,7 +225,7 @@ fn split_args(s: &str) -> Vec<String> {
     args
 }
 
-fn expand_tilde(p: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand_tilde(p: &str, home: &Path) -> PathBuf {
     if p == "~" {
         home.to_path_buf()
     } else if let Some(rest) = p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\")) {
@@ -280,7 +310,7 @@ fn is_concrete(pattern: &str) -> bool {
     !pattern.is_empty() && !pattern.starts_with('!') && !pattern.contains(['*', '?'])
 }
 
-fn aliases(lines: &[Line]) -> Vec<String> {
+fn concrete_names(lines: &[Line]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for line in lines {
@@ -289,6 +319,27 @@ fn aliases(lines: &[Line]) -> Vec<String> {
                 if seen.insert(p.clone()) {
                     out.push(p.clone());
                 }
+            }
+        }
+    }
+    out
+}
+
+/// The servers to list: concrete names, but a block that sets `HostName`
+/// is one machine (`Host tanla 203.0.113.7`), listed by its first name.
+fn aliases(lines: &[Line]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Line::Section(Some(patterns)) = line else { continue };
+        let sets_hostname = lines[i + 1..]
+            .iter()
+            .take_while(|l| !matches!(l, Line::Section(_)))
+            .any(|l| matches!(l, Line::Opt { key, .. } if key == "hostname"));
+        let concrete = patterns.iter().filter(|p| is_concrete(p));
+        for p in concrete.take(if sets_hostname { 1 } else { usize::MAX }) {
+            if seen.insert(p.clone()) {
+                out.push(p.clone());
             }
         }
     }
@@ -425,6 +476,8 @@ fn evaluate(lines: &[Line], alias: &str, ctx: &Ctx) -> HostConfig {
         identity_files,
         proxy_jump: none(opts.proxy_jump),
         forward_agent: opts.forward_agent.unwrap_or(false),
+        origin: HostOrigin::SshConfig,
+        has_saved_secret: false,
         identities_only: opts.identities_only.unwrap_or(false),
         proxy_command: none(opts.proxy_command),
     }
@@ -479,13 +532,27 @@ mod tests {
     #[test]
     fn lists_concrete_aliases_only() {
         let f = Fixture::new();
-        let hosts = f.hosts(
-            "Host a b\n  HostName example.com\nHost *.internal !x\n  User ops\n\
-             Host c?\nHost d\nHost a\n",
-        );
+        let hosts = f.hosts("Host a b\nHost *.internal !x\n  User ops\nHost c?\nHost d\nHost a\n");
         assert_eq!(names(&hosts), ["a", "b", "d"]);
-        assert_eq!(hosts[0].hostname, "example.com");
-        assert_eq!(hosts[1].hostname, "example.com");
+    }
+
+    #[test]
+    fn a_block_with_hostname_is_one_server() {
+        let f = Fixture::new();
+        let text = "Host tanla 203.0.113.7 !nope *.x\n  HostName 203.0.113.7\n  User root\n\
+                    Host web1 web2\n  User deploy\n\
+                    Host db db.lan\n  Include extra\n";
+        f.write("extra", "  HostName 10.0.0.5\n");
+        let hosts = f.hosts(text);
+        assert_eq!(names(&hosts), ["tanla", "web1", "web2", "db"]);
+        assert_eq!((hosts[1].hostname.as_str(), hosts[2].hostname.as_str()), ("web1", "web2"));
+        // Every name still connects, with the block's settings.
+        let other = f.host(text, "203.0.113.7");
+        assert_eq!((other.hostname.as_str(), other.user.as_deref()), ("203.0.113.7", Some("root")));
+        assert_eq!(f.host(text, "db.lan").hostname, "10.0.0.5");
+        let path = f.write("config", text);
+        let named = concrete_names(&parse(&path, &f.ctx()).unwrap());
+        assert_eq!(named, ["tanla", "203.0.113.7", "web1", "web2", "db", "db.lan"]);
     }
 
     #[test]

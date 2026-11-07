@@ -4,14 +4,18 @@
   import { untrack } from "svelte";
   import ChevronRight from "@lucide/svelte/icons/chevron-right";
   import FileIcon from "./FileIcon.svelte";
+  import Thumb from "./Thumb.svelte";
+  import { wantsThumbnail } from "$lib/thumbs.svelte";
   import RenameField from "./RenameField.svelte";
-  import type { Entry } from "$lib/ipc/types";
+  import type { Entry, SourceId } from "$lib/ipc/types";
   import { dnd } from "$lib/stores/dnd.svelte";
   import { iconFor } from "$lib/util/filetype";
 
   interface Props {
     entries: Entry[];
     srcKey: string;
+    /** Where `entries` live; enables row thumbnails. */
+    source?: SourceId | null;
     /** Accent selection (focused column) or grey (path / unfocused). */
     active: boolean;
     isSelected: (path: string) => boolean;
@@ -29,11 +33,11 @@
   }
 
   let {
-    entries, srcKey, active, isSelected, isCut = () => false, renaming = null, reveal = null, revealSeq = 0,
+    entries, srcKey, source = null, active, isSelected, isCut = () => false, renaming = null, reveal = null, revealSeq = 0,
     onrowdown, onrowclick, onrowdbl, onrowmenu, onbackground, onrename, oncancelrename,
   }: Props = $props();
 
-  const ROW = 22;
+  const ROW = 26;
   const PAD = 4;
   const OVERSCAN = 10;
 
@@ -91,13 +95,17 @@
         ondblclick={(e) => onrowdbl?.(e, entry)}
         oncontextmenu={(e) => onrowmenu(e, entry)}
       >
-        <FileIcon type={iconFor(entry)} link={entry.isSymlink} />
+        {#if source && wantsThumbnail(entry, { source, path: entry.path }, true)}
+          <Thumb {entry} location={{ source, path: entry.path }} size={18} />
+        {:else}
+          <FileIcon type={iconFor(entry)} size={18} link={entry.isSymlink} />
+        {/if}
         {#if renaming === entry.path && onrename}
           <RenameField {entry} oncommit={(name) => onrename(entry, name)} oncancel={() => oncancelrename?.()} />
         {:else}
           <span class="name name-text">{entry.name}</span>
         {/if}
-        {#if dir}<span class="chev"><ChevronRight size={12} strokeWidth={2.2} /></span>{/if}
+        {#if dir}<span class="chev"><ChevronRight size={13} strokeWidth={2.2} /></span>{/if}
       </div>
     {/each}
   </div>
@@ -115,7 +123,7 @@
     position: absolute;
     left: 6px;
     right: 6px;
-    height: 22px;
+    height: 26px;
     display: flex;
     align-items: center;
     gap: 6px;

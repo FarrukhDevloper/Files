@@ -3,20 +3,22 @@
   import Check from "@lucide/svelte/icons/check";
   import { ui, type MenuItem } from "$lib/stores/ui.svelte";
   import { rememberFocus } from "$lib/util/focus";
+  import { cssZoom } from "$lib/util/zoom";
 
   const menu = $derived(ui.menu!);
   let el = $state<HTMLDivElement>();
   let pos = $state({ x: 0, y: 0 });
   let active = $state(-1);
 
-  // Keep the menu on screen.
+  // Keep the menu on screen. Measured in viewport px, placed in CSS px.
   $effect(() => {
     const m = menu;
     if (!el) return;
     const r = el.getBoundingClientRect();
+    const z = cssZoom();
     pos = {
-      x: Math.max(4, Math.min(m.x, window.innerWidth - r.width - 4)),
-      y: m.y + r.height > window.innerHeight - 4 ? Math.max(4, m.y - r.height) : m.y,
+      x: Math.max(4, Math.min(m.x, window.innerWidth - r.width - 4)) / z,
+      y: (m.y + r.height > window.innerHeight - 4 ? Math.max(4, m.y - r.height) : m.y) / z,
     };
     active = -1;
     if (m.keyboard) step(1);
@@ -111,11 +113,12 @@
     background: var(--bg-popover);
     box-shadow: var(--shadow-popover);
   }
+  .menu:focus-visible { outline: none; }
   .item {
     display: flex;
     align-items: center;
     width: 100%;
-    height: 22px;
+    height: 26px;
     padding: 0 10px 0 4px;
     border-radius: 5px;
     text-align: left;
@@ -126,7 +129,7 @@
   .item.danger:not(.active) { color: var(--danger); }
   .check { width: 18px; display: grid; place-items: center; flex: none; }
   .label { flex: 1; }
-  .shortcut { margin-left: 24px; color: var(--fg-tertiary); font-size: 12px; }
+  .shortcut { margin-left: 24px; color: var(--fg-tertiary); font-size: var(--fs-secondary); }
   .item.active .shortcut { color: inherit; opacity: 0.8; }
   .sep { height: 1px; margin: 5px 10px; background: var(--separator); }
 </style>

@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "VPS Files",
-        "width": 1180,
-        "height": 740,
+        "width": 1320,
+        "height": 840,
         "minWidth": 720,
         "minHeight": 440,
         "center": true,

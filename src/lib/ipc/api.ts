@@ -5,7 +5,7 @@
 // real Rust backend answers.
 
 import type {
-  DiskSpace, Entry, EventMap, HostInfo, JobSnapshot, Location, Place, SourceId,
+  DiskSpace, EditSession, Entry, EventMap, HostDraft, HostInfo, JobSnapshot, Location, Place, SourceId,
   TextPreview, TransferRequest,
 } from "./types";
 
@@ -15,6 +15,14 @@ export interface Api {
   listHosts(): Promise<HostInfo[]>;
   connectHost(alias: string): Promise<void>;
   disconnectHost(alias: string): Promise<void>;
+  /** Create (previousAlias = null) or update an app-managed server. */
+  saveHost(draft: HostDraft, previousAlias: string | null): Promise<HostInfo>;
+  /** App-managed servers only; also deletes its saved password. */
+  removeHost(alias: string): Promise<void>;
+  /** Delete a password/passphrase saved in the OS keychain for this host. */
+  forgetPassword(alias: string): Promise<void>;
+  /** Path of ~/.ssh/config, to open it in an editor with openExternal. */
+  sshConfigPath(): Promise<string>;
 
   localPlaces(): Promise<Place[]>;
   homeDir(source: SourceId): Promise<string>;
@@ -28,8 +36,16 @@ export interface Api {
   /** Local + !permanent = move to trash. Remote is always permanent. */
   deletePaths(locations: Location[], permanent: boolean): Promise<void>;
   readText(location: Location, maxBytes: number): Promise<TextPreview>;
-  /** Open with the OS default app. Local only for now. */
-  openExternal(location: Location): Promise<void>;
+  /** Open with the OS default app. Local: opens in place, resolves null.
+   * Remote: downloads a temp copy, opens it, uploads every save back, and
+   * returns the session (updates arrive on "edit:update"). */
+  openExternal(location: Location): Promise<EditSession | null>;
+  editList(): Promise<EditSession[]>;
+  /** Stop syncing and delete the temp copy. */
+  editStop(id: string): Promise<void>;
+  /** After a conflict: "upload" = overwrite the server copy with mine,
+   * "discard" = drop my changes and re-download the server copy. */
+  editResolve(id: string, action: "upload" | "discard"): Promise<void>;
 
   transferStart(request: TransferRequest): Promise<string>;
   transferList(): Promise<JobSnapshot[]>;
@@ -40,8 +56,16 @@ export interface Api {
 
   /** http://127.0.0.1 URL usable as <video>/<audio>/<img> src. */
   mediaUrl(location: Location): Promise<string>;
+  /** "http://127.0.0.1:PORT/TOKEN" — lets media.ts build media and
+   * thumbnail URLs synchronously (no IPC per row). */
+  mediaBase(): Promise<string>;
+  /** External players found on this machine, e.g. ["mpv", "vlc"]. */
+  externalPlayers(): Promise<string[]>;
+  /** Stream the file in an external player (first found, or `player`). */
+  openInPlayer(location: Location, player: string | null): Promise<void>;
 
-  promptRespond(id: string, accept: boolean, secret: string | null): Promise<void>;
+  /** `remember` saves the password/passphrase in the OS keychain. */
+  promptRespond(id: string, accept: boolean, secret: string | null, remember?: boolean): Promise<void>;
 
   on<K extends keyof EventMap>(event: K, handler: (payload: EventMap[K]) => void): Promise<() => void>;
 }
@@ -53,6 +77,10 @@ async function tauriApi(): Promise<Api> {
     listHosts: () => invoke("list_hosts"),
     connectHost: (alias) => invoke("connect_host", { alias }),
     disconnectHost: (alias) => invoke("disconnect_host", { alias }),
+    saveHost: (draft, previousAlias) => invoke("save_host", { draft, previousAlias }),
+    removeHost: (alias) => invoke("remove_host", { alias }),
+    forgetPassword: (alias) => invoke("forget_password", { alias }),
+    sshConfigPath: () => invoke("ssh_config_path"),
 
     localPlaces: () => invoke("local_places"),
     homeDir: (source) => invoke("home_dir", { source }),
@@ -64,6 +92,9 @@ async function tauriApi(): Promise<Api> {
     deletePaths: (locations, permanent) => invoke("delete_paths", { locations, permanent }),
     readText: (location, maxBytes) => invoke("read_text", { location, maxBytes }),
     openExternal: (location) => invoke("open_external", { location }),
+    editList: () => invoke("edit_list"),
+    editStop: (id) => invoke("edit_stop", { id }),
+    editResolve: (id, action) => invoke("edit_resolve", { id, action }),
 
     transferStart: (request) => invoke("transfer_start", { request }),
     transferList: () => invoke("transfer_list"),
@@ -73,8 +104,11 @@ async function tauriApi(): Promise<Api> {
     transferClearFinished: () => invoke("transfer_clear_finished"),
 
     mediaUrl: (location) => invoke("media_url", { location }),
+    mediaBase: () => invoke("media_base"),
+    externalPlayers: () => invoke("external_players"),
+    openInPlayer: (location, player) => invoke("open_in_player", { location, player }),
 
-    promptRespond: (id, accept, secret) => invoke("prompt_respond", { id, accept, secret }),
+    promptRespond: (id, accept, secret, remember) => invoke("prompt_respond", { id, accept, secret, remember: remember ?? false }),
 
     on: (event, handler) => listen(event, (e) => handler(e.payload as never)),
   };

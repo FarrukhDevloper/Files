@@ -13,6 +13,7 @@ vpsfiles-vfs = { path = "crates/vfs" }
 vpsfiles-ssh = { path = "crates/ssh" }
 vpsfiles-transfer = { path = "crates/transfer" }
 vpsfiles-stream = { path = "crates/stream" }
+vpsfiles-edit = { path = "crates/edit" }
 
 # async + plumbing
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
@@ -34,11 +35,17 @@ russh-sftp = "3"
 hmac = "0.13"
 sha1 = "0.11"
 
+# saved passwords (OS keychain: Secret Service / Windows Credential Manager)
+keyring = "4"
+
 # media server
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 mime_guess = "2"
+# thumbnails (no avif/tiff: big decoders, rare on servers)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 
 # local fs
+notify = "8"
 trash = "5"
 fs4 = "1"
 
@@ -46,6 +53,8 @@ fs4 = "1"
 tauri = { version = "2", features = [] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-window-state = "2"
 
 [profile.release]
 # small + fast binary
